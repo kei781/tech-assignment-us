@@ -138,7 +138,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[LOCK-009]** (stale global lock 복구 — 모든 프로세스) global lock 획득 시도 중 기존 lock 파일의 `preemptedAt`이 `GLOBAL_LOCK_STALE_AFTER_MS`(기본 300,000ms)를 초과했다면, **API·Worker 어떤 프로세스든** [LOCK-010] 절차로 해당 lock을 제거한 뒤 획득을 재시도할 수 있다. Reaper가 없는 배포(API 단독 실행)에서도 영구 정지가 발생하지 않기 위한 규칙이다.
 >
-> stale global lock의 제거와 `reaper.lastGlobalLockReapAt = now` 기록은 [LOCK-010] 절차 안에서(reap-mutex 보유 중, 6단계) 함께 수행된다. 이는 복구 유예([RPR-010])의 지속적 트리거가 된다. 보조 방어로, **reap-mutex 파일이 존재하는 동안 Reaper는 [RPR-010]/[RPR-011]의 파괴적 조치를 건너뛴다**.
+> stale global lock의 제거와 `reaper.lastGlobalLockReapAt = now` 기록은 [LOCK-010] 절차 안에서(reap-mutex 보유 중, 6단계) 함께 수행된다. 이는 복구 유예([RPR-010])의 지속적 트리거가 된다. 보조 방어로, **자신이 보유하지 않은 reap-mutex 파일이 존재하는 동안 Reaper는 [RPR-010]/[RPR-011]의 파괴적 조치를 건너뛴다**.
 
 > **[LOCK-010]** (stale lock 안전 삭제 절차) stale로 판정한 lock의 삭제는 다음 순서로 수행한다:
 >
@@ -147,7 +147,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 > 3. `rename(lockPath, lockPath + '.reaping-' + myProcessId)`를 시도한다. 실패(`ENOENT` 등)하면 중단한다.
 > 4. rename된 파일을 다시 읽어 2의 판정 근거와 **`preemption`·`preemptedAt`이 모두 동일**한지 확인한다.
 > 5. 동일하면 삭제한다. 다르면 [LOCK-011]의 no-replace 복원 절차로 원래 경로에 되돌린다(복원 불가 시 rename된 파일을 삭제하고 경고 로깅 — 이 경로는 reap-mutex 직렬화 하에서는 프로세스 정지 상황에서만 도달, §6 알려진 한계).
-> 6. **(global lock을 삭제한 경우)** reap-mutex를 보유한 채 global lock을 획득하여(방금 삭제했으므로 즉시 성공 가능, 실패 시 `REAP_MUTEX_STALE_MS` 내에서 재시도) `reaper.lastGlobalLockReapAt = now`를 기록·저장하고 global lock을 해제한다. 기록·삭제가 reap-mutex 보유 중에 일어나므로 유예([RPR-010]) 발동에 공백이 없다.
+> 6. **(global lock을 삭제한 경우)** reap-mutex를 보유한 채 global lock을 획득하여(방금 삭제했으므로 즉시 성공 가능, 실패 시 `REAP_MUTEX_STALE_MS` 내에서 재시도) `reaper.lastGlobalLockReapAt = now`를 기록·저장하고 global lock을 해제한다. 기록·삭제가 reap-mutex 보유 중에 일어나므로 유예([RPR-010]) 발동에 공백이 없다. `REAP_MUTEX_STALE_MS` 내에 획득하지 못하면 기록을 포기하고 WARN을 로깅한 뒤 7단계로 진행한다(잔여 위험은 §6 참조).
 > 7. reap-mutex를 삭제한다.
 
 > **[LOCK-011]** (no-replace 복원 절차) rename으로 옮겨둔 lock 파일을 원래 경로로 되돌릴 때는 `rename`을 사용하지 않는다 — Node.js `fs.rename`은 목적지가 존재해도 조용히 덮어쓰므로, 그 사이 다른 프로세스가 `wx`로 생성한 살아있는 lock을 파괴할 수 있다. 대신 `fs.link(movedPath, lockPath)`(목적지 존재 시 `EEXIST` 보장)를 시도하고, 성공하면 `movedPath`를 삭제한다. `EEXIST`면(새 lock이 이미 생성됨) 복원을 포기하고 `movedPath`를 삭제한 뒤 경고를 로깅한다.
@@ -252,7 +252,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[API-052]** 성공 시 `updatedAt`을 갱신하고 수정된 Job을 `job` 필드로 반환한다.
 
-> **[API-053]** 거부 사유 판정 우선순위: ① Job 존재 여부(404) → ② `done`(409, 완료 메시지) → ③ `pending` 또는 per-job lock 존재(409, 처리중 메시지). `done`이면서 lock 파일이 아직 남아 있는 경우([WRK-024]의 lock 삭제 전 시간창) 완료 메시지가 우선한다.
+> **[API-053]** 거부 사유 판정 우선순위: ⓪ DTO/파라미터 validation(400, 상태 검사보다 선행) → ① Job 존재 여부(404) → ② `done`(409, 완료 메시지) → ③ `pending` 또는 per-job lock 존재(409, 처리중 메시지). `done`이면서 lock 파일이 아직 남아 있는 경우([WRK-024]의 lock 삭제 전 시간창) 완료 메시지가 우선한다.
 
 | 상황 | HTTP 상태 | `result` |
 |---|---:|---|
@@ -279,7 +279,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 예: `[2026-09-03T20:00:00.000Z] [INFO] [http] POST /jobs 201 12ms`
 
 - `LEVEL`: `INFO` | `WARN` | `ERROR` | `FATAL`
-- `scope`: `http`(요청 로깅) | `worker`(claim·완료·롤백) | `reaper`(선출·복구 조치) | `storage`(lock·저장·초기화 관련 오류)
+- `scope`: `http`(요청 로깅) | `worker`(claim·완료·롤백) | `reaper`(Reaper cleanup의 선출·복구 조치) | `storage`(lock·저장·초기화 관련. [LOCK-009] 경로의 stale lock 제거는 수행 주체와 무관하게 `storage`로 기록)
 
 > **[LOG-003]** **모든 HTTP 요청**을 로깅한다: method, path(query 포함), 응답 상태 코드, 처리 시간(ms). 에러 응답도 포함한다.
 
@@ -352,7 +352,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 > - **lock 파일 삭제는 [LOCK-010]의 안전 삭제 절차(판정 근거 동일성 재확인)를 따른다.** 판정 시점과 내용이 달라졌으면(다른 Worker가 재획득) 삭제하지 않는다.
 > - 내용이 비었거나 파싱 불가한 lock 파일은 파일 mtime이 `REAPER_STALE_AFTER_MS`(기본 5분)를 경과하기 전에는 건드리지 않고, 경과 후 orphan으로 간주해 삭제한다.
 > - 살아 있는 Worker의 lock은 삭제하지 않는다.
-> - lock 스캔은 정확히 `{jobId}-lock.json` 패턴의 파일만 대상으로 한다. `*.reaping-*`, `*.release-*`, `*.tmp` 등 절차상 잔존 가능한 파일은 lock으로 취급하지 않으며, mtime이 `REAPER_STALE_AFTER_MS`를 경과한 잔존 파일은 Reaper가 삭제한다.
+> - lock 스캔은 정확히 `{jobId}-lock.json` 패턴의 파일만 대상으로 한다. `*.reaping-*`, `*.release-*`, `*.tmp` 등 절차상 잔존 가능한 파일은 lock으로 취급하지 않으며, mtime이 `REAPER_STALE_AFTER_MS`를 경과한 잔존 파일은 locks 디렉터리와 `STORAGE_DIR`(저장용 `jobs.json.*.tmp` 포함) 양쪽에서 Reaper가 삭제한다.
 
 > **[RPR-012]** Stale global lock 복구: `jobs-global-lock.json`이 다음 중 하나면 stale 후보다.
 >
