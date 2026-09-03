@@ -82,7 +82,7 @@
 
 > **[DATA-003]** 모든 시각은 ISO 8601 UTC(`...Z`) 문자열로 기록·비교한다.
 
-> **[DATA-004]** 저장소에는 조회 동작 확인용 **샘플 데이터가 포함된 `data/jobs.json`을 커밋**한다. 샘플에는 `create`, `pending`, `done` 상태의 Job이 최소 1건씩 포함된다. 샘플의 `pending` Job은 per-job lock 없이 커밋되므로, Worker 기동 시 [RPR-013]에 의해 `create`로 복구된 뒤 정상 처리된다.
+> **[DATA-004]** 저장소에는 조회 동작 확인용 **샘플 데이터가 포함된 `data/jobs.json`을 커밋**한다. 샘플에는 `create`, `pending`, `done` 상태의 Job이 최소 1건씩 포함된다. 샘플의 `pending` Job은 per-job lock 없이 커밋되므로, Worker 기동 후 Reaper가 선출되고 [RPR-013]의 조건(`updatedAt` 5분 초과)이 충족되면 `create`로 복구된 뒤 정상 처리된다.
 
 ### 2.2 상태 머신
 
@@ -122,7 +122,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[LOCK-003]** 두 lock 모두 **생성과 내용 기록을 단일 원자 호출**로 수행한다: `fs.writeFile(path, content, { flag: 'wx' })`. 성공 시 소유권 획득, `EEXIST` 시 획득 실패로 처리한다. "존재 확인 후 쓰기" 방식과 "빈 파일 생성 후 내용 기록" 2단계 방식은 금지한다.
 
-> **[LOCK-004]** 정상 해제는 소유자만 수행하며, 원자성을 위해 rename을 경유한다: ① `rename(lockPath, lockPath + '.release-' + myProcessId)` 시도 — `ENOENT`면 lock이 이미 사라진 것이므로 오류를 로깅하고 중단. ② rename된 파일을 읽어 `preemption`이 자신의 Process ID와 일치하면 삭제. ③ 일치하지 않으면(다른 주체가 복구·재획득한 lock을 잡은 것) 원래 경로로 되돌리고 오류를 로깅한다.
+> **[LOCK-004]** 정상 해제는 소유자만 수행하며, 원자성을 위해 rename을 경유한다: ① `rename(lockPath, lockPath + '.release-' + myProcessId)` 시도 — `ENOENT`면 lock이 이미 사라진 것이므로 오류를 로깅하고 중단. ② rename된 파일을 읽어 `preemption`이 자신의 Process ID와 일치하면 삭제. ③ 일치하지 않으면(다른 주체가 복구·재획득한 lock을 잡은 것) [LOCK-011]의 no-replace 복원 절차로 원래 경로에 되돌리고 오류를 로깅한다.
 
 > **[LOCK-005]** 모든 `jobs.json` 변경은 다음 순서를 지킨다: `global lock 획득 → jobs.json을 디스크에서 reload → 조건 재검증 → 변경 → 저장 → global lock 해제`. `node-json-db` 인메모리 캐시로 덮어쓰는 것을 금지한다(획득 후 reload 필수).
 >
@@ -138,16 +138,19 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[LOCK-009]** (stale global lock 복구 — 모든 프로세스) global lock 획득 시도 중 기존 lock 파일의 `preemptedAt`이 `GLOBAL_LOCK_STALE_AFTER_MS`(기본 300,000ms)를 초과했다면, **API·Worker 어떤 프로세스든** [LOCK-010] 절차로 해당 lock을 제거한 뒤 획득을 재시도할 수 있다. Reaper가 없는 배포(API 단독 실행)에서도 영구 정지가 발생하지 않기 위한 규칙이다.
 >
-> stale global lock을 제거한 프로세스는 **직후 자신이 진입하는 첫 global lock 임계 구역에서 `reaper.lastGlobalLockReapAt = now`를 기록**해야 한다. 이는 복구 유예([RPR-010])의 지속적 트리거가 된다.
+> stale global lock의 제거와 `reaper.lastGlobalLockReapAt = now` 기록은 [LOCK-010] 절차 안에서(reap-mutex 보유 중, 6단계) 함께 수행된다. 이는 복구 유예([RPR-010])의 지속적 트리거가 된다. 보조 방어로, **reap-mutex 파일이 존재하는 동안 Reaper는 [RPR-010]/[RPR-011]의 파괴적 조치를 건너뛴다**.
 
 > **[LOCK-010]** (stale lock 안전 삭제 절차) stale로 판정한 lock의 삭제는 다음 순서로 수행한다:
 >
-> 1. **reap-mutex 획득**: `locks/reap-mutex.json`을 [LOCK-003] 방식(`wx`, 내용: `preemption`, `preemptedAt`)으로 생성한다. `EEXIST`면 다른 프로세스가 reaping 중이므로 중단한다. 단, 기존 reap-mutex의 `preemptedAt`(파싱 불가 시 파일 mtime)이 `REAP_MUTEX_STALE_MS`(기본 60,000ms)를 초과했으면 직접 삭제 후 재시도할 수 있다(reap-mutex는 ms 단위로만 보유되므로).
+> 1. **reap-mutex 획득**: `{STORAGE_DIR}/locks/reap-mutex.json`을 [LOCK-003] 방식(`wx`, 내용: `preemption`, `preemptedAt`)으로 생성한다. `EEXIST`면 다른 프로세스가 reaping 중이므로 중단한다. 단, 기존 reap-mutex의 `preemptedAt`(파싱 불가 시 파일 mtime)이 `REAP_MUTEX_STALE_MS`(기본 60,000ms)를 초과했으면 직접 삭제 후 재시도할 수 있다(reap-mutex는 ms 단위로만 보유되므로).
 > 2. **삭제 직전 재판정**: 대상 lock 파일을 다시 읽어 stale 조건이 여전히 성립하는지 확인한다. 성립하지 않으면(그 사이 새 lock으로 교체됨) 중단한다. 판정 근거(`preemption`, `preemptedAt`)를 기록한다.
 > 3. `rename(lockPath, lockPath + '.reaping-' + myProcessId)`를 시도한다. 실패(`ENOENT` 등)하면 중단한다.
 > 4. rename된 파일을 다시 읽어 2의 판정 근거와 **`preemption`·`preemptedAt`이 모두 동일**한지 확인한다.
-> 5. 동일하면 삭제한다. 다르면 원래 경로로 rename을 되돌린다. 되돌리기가 `EEXIST`로 실패하면 rename된 파일을 삭제하고 경고를 로깅한다(이 경로는 reap-mutex 직렬화 하에서는 프로세스 정지 상황에서만 도달 — §6 알려진 한계).
-> 6. reap-mutex를 삭제한다.
+> 5. 동일하면 삭제한다. 다르면 [LOCK-011]의 no-replace 복원 절차로 원래 경로에 되돌린다(복원 불가 시 rename된 파일을 삭제하고 경고 로깅 — 이 경로는 reap-mutex 직렬화 하에서는 프로세스 정지 상황에서만 도달, §6 알려진 한계).
+> 6. **(global lock을 삭제한 경우)** reap-mutex를 보유한 채 global lock을 획득하여(방금 삭제했으므로 즉시 성공 가능, 실패 시 `REAP_MUTEX_STALE_MS` 내에서 재시도) `reaper.lastGlobalLockReapAt = now`를 기록·저장하고 global lock을 해제한다. 기록·삭제가 reap-mutex 보유 중에 일어나므로 유예([RPR-010]) 발동에 공백이 없다.
+> 7. reap-mutex를 삭제한다.
+
+> **[LOCK-011]** (no-replace 복원 절차) rename으로 옮겨둔 lock 파일을 원래 경로로 되돌릴 때는 `rename`을 사용하지 않는다 — Node.js `fs.rename`은 목적지가 존재해도 조용히 덮어쓰므로, 그 사이 다른 프로세스가 `wx`로 생성한 살아있는 lock을 파괴할 수 있다. 대신 `fs.link(movedPath, lockPath)`(목적지 존재 시 `EEXIST` 보장)를 시도하고, 성공하면 `movedPath`를 삭제한다. `EEXIST`면(새 lock이 이미 생성됨) 복원을 포기하고 `movedPath`를 삭제한 뒤 경고를 로깅한다.
 
 ---
 
@@ -211,9 +214,9 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 >
 > 과제 원문은 "제목/상태로 검색"을 요구한다. 설계 문서의 `title`/`description`에 **`status`를 추가**하여 과제 요구를 충족한다.
 
-> **[API-031]** 매칭 규칙:
+> **[API-031]** 매칭 규칙 (모든 파라미터는 **trim된 값**으로 매칭한다):
 > - `title`, `description`: **대소문자 구분 없는 부분 일치**
-> - `status`: enum 정확 일치 (`create` | `pending` | `done`). 그 외 값은 `400`
+> - `status`: trim 후 enum 정확 일치 (`create` | `pending` | `done`). 그 외 값은 `400`
 > - 복수 조건은 **AND** 결합
 > - 결과 목록 정렬은 [API-020]과 동일
 
@@ -275,6 +278,9 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 예: `[2026-09-03T20:00:00.000Z] [INFO] [http] POST /jobs 201 12ms`
 
+- `LEVEL`: `INFO` | `WARN` | `ERROR` | `FATAL`
+- `scope`: `http`(요청 로깅) | `worker`(claim·완료·롤백) | `reaper`(선출·복구 조치) | `storage`(lock·저장·초기화 관련 오류)
+
 > **[LOG-003]** **모든 HTTP 요청**을 로깅한다: method, path(query 포함), 응답 상태 코드, 처리 시간(ms). 에러 응답도 포함한다.
 
 > **[LOG-004]** Worker는 **처리 결과**를 로깅한다. 최소 대상: Job claim(선점), 처리 완료(done), 처리 실패·롤백, Reaper 선출, Reaper의 복구 조치(orphan lock 정리, stale worker 삭제, stale global lock 삭제, pending-무lock 롤백).
@@ -300,7 +306,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[WRK-003]** 같은 프로세스에서 이전 consume이 끝나지 않았으면 다음 consume tick은 건너뛴다(`isConsuming` guard). Worker 1대는 동시에 Job 1개만 처리한다.
 
-> **[WRK-004]** 정상 종료(`SIGINT`/`SIGTERM`/shutdown hook) 시: ① 새 스케줄 실행 중지 → ② 보유 중인 `pending` Job을 **항상 `create`로 롤백** → ③ 보유한 per-job lock을 [LOCK-004]에 따라 삭제 → ④ `workers[workerId]` 삭제 → ⑤ 자신이 Reaper면 `reaper.workerId` 초기화.
+> **[WRK-004]** 정상 종료(`SIGINT`/`SIGTERM`/shutdown hook) 시: ① 새 스케줄 실행 중지 → ② 보유 중인 `pending` Job을 [LOCK-005] 임계 구역에서 **항상 `create`로 롤백** → ③ 보유한 per-job lock을 [LOCK-004]에 따라 삭제 → ④ `workers[workerId]` 삭제 → ⑤ 자신이 Reaper면 `reaper.workerId` 초기화.
 
 ### 5.2 Heartbeat
 
@@ -380,6 +386,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 - lock 소유자가 stale timeout(`GLOBAL_LOCK_STALE_AFTER_MS` 5분, 등록용 lock은 `GLOBAL_LOCK_ORPHAN_MIN_MS` 3분)을 넘겨 정지했다가 살아나는 GC pause·컨테이너 throttling.
 - [LOCK-010] 절차 중간(재판정과 rename 사이 등)에 reaping 프로세스가 장시간 정지하는 경우.
 - reap-mutex 자체가 stale(`REAP_MUTEX_STALE_MS` 60초 초과)로 판정되어 직접 삭제되는 경로 — reap-mutex는 ms 단위로만 보유되므로 실질 위험은 극히 작다.
+- [LOCK-010] 5~6단계 사이(global lock 삭제 후, `lastGlobalLockReapAt` 기록 전) reaping 프로세스가 crash하면 유예 기록이 소실될 수 있다. reap-mutex 존재 중에는 파괴적 조치가 중단되므로([LOCK-009]) 창은 reap-mutex가 stale 판정되는 시점(60초) 이후로 한정된다.
 
 본 명세는 reap 직렬화([LOCK-010] reap-mutex), 삭제 직전 재판정, rename 원자화([LOCK-004]/[LOCK-010]), 최소 경과 시간([RPR-012] ①), 복구 유예 영속화([RPR-010]), 원자적 저장([LOCK-005])으로 위험 창을 ms 수준까지 최소화한다. 강한 보장이 필요하면 DB row lock·전용 queue로 이전한다.
 
@@ -436,7 +443,7 @@ data/
 > **[RUN-004]** 부트스트랩 초기화: 프로세스 기동 시 순서대로 —
 >
 > 1. `STORAGE_DIR`·locks 디렉터리가 없으면 생성한다(멱등).
-> 2. `jobs.json`이 없으면 기본 스키마 `{ "jobs": [], "workers": {}, "reaper": { "workerId": null, "lastGlobalLockReapAt": null } }`를 **`wx` flag로 생성**한다. `EEXIST`면 다른 프로세스가 이미 생성한 것이므로 건너뛴다(동시 기동 race 방지 — 일반 write로 기존 데이터를 덮어쓰는 것을 금지).
+> 2. `jobs.json`이 없으면 기본 스키마 `{ "jobs": [], "workers": {}, "reaper": { "workerId": null, "lastGlobalLockReapAt": null } }`로 생성한다. 배타성과 내용 원자성을 함께 보장하기 위해, **임시 파일([LOCK-005] 명명 규칙)에 완전히 기록한 뒤 `fs.link(tmpPath, jobsJsonPath)`로 연결**하고 임시 파일을 삭제한다. `EEXIST`면 다른 프로세스가 이미 생성한 것이므로 임시 파일만 삭제하고 건너뛴다(동시 기동 race 방지 — 일반 write로 기존 데이터를 덮어쓰는 것과, `wx` 직접 쓰기 중 crash로 인한 부분 파일 잔존을 모두 방지).
 > 3. 최상위 키 누락 보정은 **global lock 임계 구역에서 reload 후** 수행한다([LOCK-005] 준수).
 > 4. `jobs.json`이 파싱 불가(손상)하면 **자동으로 초기화하지 않는다**(데이터 보호 우선). 기동 시 감지하면 FATAL 로깅 후 비-0 종료 코드로 중단하고, 런타임 reload 중 감지하면 해당 API 요청은 `500`, 해당 Worker tick은 중단 처리하며 오류를 로깅한다.
 
@@ -491,6 +498,8 @@ data/
 | 21 | 저장 임시 파일 | 미규정 | Process ID+난수 포함 파일명([LOCK-005]) | 프로세스 간 임시 파일 충돌로 인한 부분 쓰기 rename 방지 |
 | 22 | `node-json-db` 저장 경로 | 자체 save | 파싱·조작에만 사용, persist는 원자적 rename으로 자체 수행 | 기술 스택 요건과 crash-safety 양립 |
 | 23 | `:id` 검증 범위 | GET만 언급 | `:id` 라우트 전체([API-040]) | PATCH의 형식 오류 응답 결정성 |
+| 24 | lock 복원 방식 | 없음 | no-replace 복원(`fs.link`, [LOCK-011]) | `fs.rename`은 목적지 존재 시 조용히 덮어쓰므로 살아있는 lock 파괴 가능 — 도달 불가능한 `EEXIST` 가드 대체 |
+| 25 | 유예 기록 시점 | 없음 | global lock 삭제와 같은 reap-mutex 보유 구간에서 기록([LOCK-010] 6단계) | "다음 임계 구역" 지연 기록 시 유예 발동 공백 발생 |
 
 ## 부록 B. 초기설계 대비 확정 사항
 
