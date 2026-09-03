@@ -1,0 +1,21 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# runtime data (샘플 데이터인 data/jobs.json은 커밋 대상)
+data/locks/
+logs.txt
+
+# env
+.env
+.env.*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# 채용 과제 원문은 비공개 자료이므로 public 저장소에 포함하지 않는다
+docs/어스얼라이언스 백엔드 엔지니어 채용 과제.md
