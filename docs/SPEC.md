@@ -26,15 +26,17 @@
 | Job | 처리 대상 작업 단위. `jobs.json`의 `jobs` 배열 원소 |
 | Global lock | `jobs.json` 읽기-수정-쓰기를 직렬화하는 파일 잠금 (`jobs-global-lock.json`) |
 | Per-job lock | 단일 Job의 처리 소유권을 보장하는 파일 잠금 (`{jobId}-lock.json`) |
-| Worker ID | Worker 프로세스가 시작 시 생성하는 64자리 hex 문자열 |
+| Process ID | 모든 프로세스(API·Worker)가 시작 시 생성하는 64자리 hex 문자열 |
+| Worker ID | Worker 프로세스의 Process ID. `workers` 레지스트리의 키 |
 | Reaper | Worker 중 선출된 1대. stale 데이터(고아 lock, 죽은 worker 레코드)를 복구 |
 | Claim(선점) | Worker가 per-job lock을 획득하고 Job을 `pending`으로 전이시키는 행위 |
 
 ### 1.3 기술 스택 (고정)
 
 - NestJS (TypeScript), `node-json-db`, `@nestjs/schedule`
-- 프로세스 간 잠금: `fs.open(path, 'wx')` 기반 파일 잠금
-- Job ID: UUID v4 / Worker(프로세스) ID: `randomBytes(32).toString('hex')` (64 hex)
+- 프로세스 간 잠금: exclusive create(`wx` flag) 기반 파일 잠금
+- Job ID: UUID v4
+- Process ID: `randomBytes(32).toString('hex')` (64 hex). **API 프로세스를 포함한 모든 프로세스**가 시작 시 1회 생성하여 종료까지 사용하며, Worker는 이 값을 Worker ID로도 사용한다.
 
 ---
 
@@ -68,15 +70,17 @@
 | 필드 | 형식 | 규칙 |
 |---|---|---|
 | `id` | UUID v4 | PK. 생성 후 불변 |
-| `title` | string | 필수. 공백 제거 후 1자 이상, **최대 1,000자** |
-| `description` | string | 필수. 공백 제거 후 1자 이상, **최대 2,000자** |
+| `title` | string | 필수. trim(앞뒤 공백 제거) 후 1자 이상, **최대 1,000자** |
+| `description` | string | 필수. trim 후 1자 이상, **최대 2,000자** |
 | `status` | enum | `create` \| `pending` \| `done` |
 | `createdAt` | ISO 8601 UTC | 생성 시각. 불변 |
 | `updatedAt` | ISO 8601 UTC | 마지막 변경 시각 |
 
+- `title`·`description`은 **trim된 값을 저장**하며, 길이 제한도 trim 후 값 기준으로 판정한다.
+
 > **[DATA-003]** 모든 시각은 ISO 8601 UTC(`...Z`) 문자열로 기록·비교한다.
 
-> **[DATA-004]** 저장소에는 조회 동작 확인용 **샘플 데이터가 포함된 `data/jobs.json`을 커밋**한다. 샘플에는 `create`, `pending`, `done` 상태의 Job이 최소 1건씩 포함된다.
+> **[DATA-004]** 저장소에는 조회 동작 확인용 **샘플 데이터가 포함된 `data/jobs.json`을 커밋**한다. 샘플에는 `create`, `pending`, `done` 상태의 Job이 최소 1건씩 포함된다. 샘플의 `pending` Job은 per-job lock 없이 커밋되므로, Worker 기동 시 [RPR-013]에 의해 `create`로 복구된 뒤 정상 처리된다.
 
 ### 2.2 상태 머신
 
@@ -112,19 +116,30 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 { "preemption": "<64-hex process id>", "ownerType": "api", "preemptedAt": "2026-09-03T20:00:00.000Z" }
 ```
 
-- `ownerType`은 `"api"` 또는 `"worker"`. API 프로세스는 `workers` 레지스트리에 등록되지 않으므로, Reaper의 stale 판정 시 구분에 사용한다.
+- `ownerType`은 `"api"` 또는 `"worker"`. API 프로세스는 `workers` 레지스트리에 등록되지 않으므로, stale 판정 시 구분에 사용한다.
 
-> **[LOCK-003]** 두 lock 모두 **반드시 `fs.open(path, 'wx')`** 로 원자적으로 생성한다. 성공 시 소유권 획득, `EEXIST` 시 획득 실패로 처리한다. "존재 확인 후 쓰기" 방식은 금지한다.
+> **[LOCK-003]** 두 lock 모두 **생성과 내용 기록을 단일 원자 호출**로 수행한다: `fs.writeFile(path, content, { flag: 'wx' })`. 성공 시 소유권 획득, `EEXIST` 시 획득 실패로 처리한다. "존재 확인 후 쓰기" 방식과 "빈 파일 생성 후 내용 기록" 2단계 방식은 금지한다.
 
-> **[LOCK-004]** lock 해제는 lock 파일 삭제로 수행한다.
+> **[LOCK-004]** 정상 해제는 소유자만 수행한다. 소유자는 **삭제 직전 lock 파일을 다시 읽어 `preemption`이 자신의 Process ID와 일치하는지 확인**하고, 일치할 때만 삭제한다. 파일이 없거나 `preemption`이 다르면(다른 주체가 복구·재획득한 경우) 삭제하지 않고 오류를 로깅한다.
 
 > **[LOCK-005]** 모든 `jobs.json` 변경은 다음 순서를 지킨다: `global lock 획득 → jobs.json을 디스크에서 reload → 조건 재검증 → 변경 → 저장 → global lock 해제`. `node-json-db` 인메모리 캐시로 덮어쓰는 것을 금지한다(획득 후 reload 필수).
+>
+> **저장은 임시 파일에 기록한 뒤 원자적 rename으로 `jobs.json`을 교체**한다. 저장 도중 crash가 나도 기존 파일이 손상되지 않아야 한다.
 
-> **[LOCK-006]** 일관된 snapshot이 필요한 읽기(목록/검색/단건 조회, Worker 후보 조회)도 동일한 global lock 임계 구역에서 수행한다.
+> **[LOCK-006]** 일관된 snapshot이 필요한 읽기(목록/검색/단건 조회, Worker 후보 조회)도 동일한 global lock 임계 구역에서 수행한다. **예외**: [LOCK-009]/[RPR-012]의 stale 판정을 위한 lock 파일·`jobs.json` 읽기는 global lock 없이 수행한다(판정 대상이 global lock 자신이므로).
 
 > **[LOCK-007]** 잠금 획득 순서는 **per-job lock → global lock**이다. global lock을 보유한 채 per-job lock을 획득하지 않는다. global lock을 보유한 채 장시간 처리·sleep을 하지 않는다.
 
-> **[LOCK-008]** global lock 경합 시: Worker는 1초 간격으로 무기한 재시도한다. API는 최대 대기 시간(`GLOBAL_LOCK_API_WAIT_MS`, 기본 5,000ms) 안에 획득하지 못하면 `503 Service Unavailable`을 반환한다.
+> **[LOCK-008]** global lock 경합 시: 모든 프로세스는 `GLOBAL_LOCK_RETRY_MS`(기본 1,000ms) 간격으로 재시도한다. Worker는 무기한 재시도하고, API는 누적 대기가 `GLOBAL_LOCK_API_WAIT_MS`(기본 5,000ms)를 초과하면 `503 Service Unavailable`을 반환한다.
+
+> **[LOCK-009]** (stale global lock 복구 — 모든 프로세스) global lock 획득 시도 중 기존 lock 파일의 `preemptedAt`이 `GLOBAL_LOCK_STALE_AFTER_MS`(기본 300,000ms)를 초과했다면, **API·Worker 어떤 프로세스든** [LOCK-010] 절차로 해당 lock을 제거한 뒤 획득을 재시도할 수 있다. Reaper가 없는 배포(API 단독 실행)에서도 영구 정지가 발생하지 않기 위한 규칙이다.
+
+> **[LOCK-010]** (stale lock 안전 삭제 절차) stale로 판정한 lock의 삭제는 다음 순서로 수행한다:
+>
+> 1. lock 파일을 읽어 stale 판정 근거(`preemption`, `preemptedAt`)를 기록한다.
+> 2. `rename(lockPath, lockPath + '.reaping-' + myProcessId)`를 시도한다. rename은 원자적이므로 성공자는 1명이다. 실패(ENOENT 등)하면 다른 프로세스가 이미 처리한 것이므로 중단한다.
+> 3. rename된 파일을 다시 읽어 1의 판정 근거와 **`preemption`·`preemptedAt`이 모두 동일**한지 확인한다.
+> 4. 동일하면 삭제한다. 다르면(그 사이 교체된 살아있는 lock을 잡은 것) 원래 경로로 rename을 되돌린다. 되돌리기가 `EEXIST`로 실패하면 rename된 파일을 삭제하고 경고를 로깅한다.
 
 ---
 
@@ -139,14 +154,14 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 ```
 
 - `status`: HTTP 상태 코드와 동일한 숫자
-- `result`: 성공 시 `"success"`, 그 외에는 한국어 사유 메시지
+- `result`: 성공 시 `"success"`, 그 외에는 한국어 사유 메시지. **단 하나의 예외**로, 검색 결과 없음([API-032])은 `200`이면서 `result`에 사유 메시지를 담는다.
 - 목록 응답은 `list`(배열), 단건 응답은 `job`(객체)을 추가한다.
 
 > **[API-002]** 본문의 `status`는 실제 HTTP 응답 상태 코드와 항상 일치해야 한다.
 
 > **[API-003]** DTO validation 실패는 `400 Bad Request`와 사유 메시지를 반환한다. 정의되지 않은 필드는 거부한다(whitelist + forbidNonWhitelisted).
 
-> **[API-004]** 처리 중 내부 오류는 `500 Internal Server Error`, global lock 대기 초과는 `503 Service Unavailable`을 반환한다. 어떤 경우에도 [API-001] 형식을 유지한다.
+> **[API-004]** 처리 중 내부 오류는 `500 Internal Server Error`를 반환한다. **모든 엔드포인트**는 [LOCK-006]에 따라 global lock을 경유하므로, 대기 초과 시 `503 Service Unavailable`([LOCK-008])을 반환할 수 있다(각 엔드포인트 표에 별도 기재하지 않는다). 어떤 경우에도 [API-001] 형식을 유지한다.
 
 ### 3.2 Endpoint 요약
 
@@ -176,16 +191,15 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 |---|---:|
 | 성공 | 201 |
 | validation 실패(누락·타입·길이 초과) | 400 |
-| global lock 대기 초과 | 503 |
 | 저장 실패 | 500 |
 
 ### 3.4 `GET /jobs`
 
-> **[API-020]** 전체 Job을 `list`로 반환한다. 빈 목록도 `200 OK` + `list: []`이다.
+> **[API-020]** 전체 Job을 `createdAt` ASC, 동률 시 `id` ASC로 정렬해 `list`로 반환한다. 빈 목록도 `200 OK` + `list: []`이다.
 
 ### 3.5 `GET /jobs/search`
 
-> **[API-030]** Query parameter: `title`, `description`, `status` — **셋 중 하나 이상 필수**.
+> **[API-030]** Query parameter: `title`, `description`, `status` — **셋 중 하나 이상 필수**. trim 후 빈 문자열인 파라미터는 **미입력으로 간주**한다(예: `?title=`은 title 미입력, `?title=&status=done`은 status만 입력한 것).
 >
 > 과제 원문은 "제목/상태로 검색"을 요구한다. 설계 문서의 `title`/`description`에 **`status`를 추가**하여 과제 요구를 충족한다.
 
@@ -193,6 +207,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 > - `title`, `description`: **대소문자 구분 없는 부분 일치**
 > - `status`: enum 정확 일치 (`create` | `pending` | `done`). 그 외 값은 `400`
 > - 복수 조건은 **AND** 결합
+> - 결과 목록 정렬은 [API-020]과 동일
 
 > **[API-032]** 응답:
 
@@ -200,7 +215,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 |---|---:|---|---|
 | 검색 성공(1건 이상) | 200 | `success` | 매칭된 Job 배열 |
 | 검색 결과 없음 | 200 | `데이터가 존재하지 않습니다.` | `[]` |
-| 조건 없음 | 400 | `title, description, status 중 하나 이상을 입력하여 주세요.` | 없음 |
+| 유효 조건 없음(전부 미입력) | 400 | `title, description, status 중 하나 이상을 입력하여 주세요.` | 없음 |
 | `status`에 잘못된 값 | 400 | 유효성 검사 사유 | 없음 |
 
 ### 3.6 `GET /jobs/:id`
@@ -226,12 +241,14 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[API-052]** 성공 시 `updatedAt`을 갱신하고 수정된 Job을 `job` 필드로 반환한다.
 
+> **[API-053]** 거부 사유 판정 우선순위: ① Job 존재 여부(404) → ② `done`(409, 완료 메시지) → ③ `pending` 또는 per-job lock 존재(409, 처리중 메시지). `done`이면서 lock 파일이 아직 남아 있는 경우([WRK-024]의 lock 삭제 전 시간창) 완료 메시지가 우선한다.
+
 | 상황 | HTTP 상태 | `result` |
 |---|---:|---|
 | 수정 성공 | 200 | `success` |
 | Job 없음 | 404 | `존재하지 않는 데이터입니다.` |
-| `pending` 또는 per-job lock 존재 | 409 | `처리중인 프로세스입니다.` |
 | `done` | 409 | `이미 완료된 프로세스입니다.` |
+| `pending` 또는 per-job lock 존재 | 409 | `처리중인 프로세스입니다.` |
 | validation 실패 | 400 | 유효성 검사 사유 |
 
 ---
@@ -252,7 +269,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[LOG-003]** **모든 HTTP 요청**을 로깅한다: method, path(query 포함), 응답 상태 코드, 처리 시간(ms). 에러 응답도 포함한다.
 
-> **[LOG-004]** Worker는 **처리 결과**를 로깅한다. 최소 대상: Job claim(선점), 처리 완료(done), 처리 실패·롤백, Reaper 선출, Reaper의 복구 조치(orphan lock 정리, stale worker 삭제, stale global lock 삭제).
+> **[LOG-004]** Worker는 **처리 결과**를 로깅한다. 최소 대상: Job claim(선점), 처리 완료(done), 처리 실패·롤백, Reaper 선출, Reaper의 복구 조치(orphan lock 정리, stale worker 삭제, stale global lock 삭제, pending-무lock 롤백).
 
 > **[LOG-005]** 로그 기록 실패가 API 응답이나 Worker 처리를 실패시키면 안 된다(best-effort).
 
@@ -275,7 +292,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[WRK-003]** 같은 프로세스에서 이전 consume이 끝나지 않았으면 다음 consume tick은 건너뛴다(`isConsuming` guard). Worker 1대는 동시에 Job 1개만 처리한다.
 
-> **[WRK-004]** 정상 종료(`SIGINT`/`SIGTERM`/shutdown hook) 시: ① 새 스케줄 실행 중지 → ② 보유 중인 `pending` Job을 `create`로 롤백(또는 안전 완료) → ③ 보유한 per-job lock 삭제 → ④ `workers[workerId]` 삭제 → ⑤ 자신이 Reaper면 `reaper.workerId` 초기화.
+> **[WRK-004]** 정상 종료(`SIGINT`/`SIGTERM`/shutdown hook) 시: ① 새 스케줄 실행 중지 → ② 보유 중인 `pending` Job을 **항상 `create`로 롤백** → ③ 보유한 per-job lock을 [LOCK-004]에 따라 삭제 → ④ `workers[workerId]` 삭제 → ⑤ 자신이 Reaper면 `reaper.workerId` 초기화.
 
 ### 5.2 Heartbeat
 
@@ -288,35 +305,48 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 > **[WRK-020]** 후보 조회: [LOCK-006] snapshot에서 `status === "create"`인 Job을 `createdAt` ASC, 동률 시 `id` ASC로 정렬한다.
 
 > **[WRK-021]** Claim 절차 (후보별):
-> 1. `{jobId}-lock.json`을 `wx`로 생성 시도. `EEXIST`면 **즉시 다음 후보로 이동**(대기 금지).
-> 2. 성공 시 lock 파일에 `preemption = workerId`, `preemptedAt = now` 기록.
-> 3. [LOCK-005] 임계 구역에서 해당 Job이 여전히 `create`인지 재검증.
-> 4. `create`가 아니면 per-job lock 삭제 후 다음 후보로 이동.
-> 5. `create`면 `status = "pending"`, `updatedAt = now`로 저장하고 임계 구역을 빠져나온 뒤 처리를 시작한다.
+> 1. `{jobId}-lock.json`을 [LOCK-003]에 따라 내용(`preemption = workerId`, `preemptedAt = now`)과 함께 단일 호출로 생성 시도. `EEXIST`면 **즉시 다음 후보로 이동**(대기 금지).
+> 2. [LOCK-005] 임계 구역에서 해당 Job이 여전히 `create`인지 재검증.
+> 3. `create`가 아니면 per-job lock을 [LOCK-004]에 따라 삭제 후 다음 후보로 이동.
+> 4. `create`면 `status = "pending"`, `updatedAt = now`로 저장하고 임계 구역을 빠져나온 뒤 처리를 시작한다.
 
 > **[WRK-022]** 다음 경우에만 다음 tick까지 대기한다: `create` Job이 없음 / 모든 후보의 lock 획득 실패 / 재검증 결과 모든 후보가 `create`가 아님.
 
 > **[WRK-023]** 처리: 기본 `JOB_PROCESSING_MS`(기본 60,000ms) 동안 수행하는 것으로 간주한다(별도 비즈니스 로직 없음).
 
-> **[WRK-024]** 완료 절차: [LOCK-005] 임계 구역에서 ① `status === "pending"` 재확인, ② per-job lock의 `preemption === workerId` 재확인 → 모두 만족 시 `status = "done"`, `updatedAt = now` 저장 → 임계 구역 종료 후 per-job lock 삭제. 소유권 검증 실패 시 `done`으로 **덮어쓰지 않고** 오류를 로깅하며 자신이 소유한 lock만 정리한다.
+> **[WRK-024]** 완료 절차: [LOCK-005] 임계 구역에서 ① `status === "pending"` 재확인, ② per-job lock의 `preemption === workerId` 재확인 → 모두 만족 시 `status = "done"`, `updatedAt = now` 저장 → 임계 구역 종료 후 per-job lock을 [LOCK-004]에 따라 삭제. 소유권 검증 실패 시 `done`으로 **덮어쓰지 않고** 오류를 로깅하며, [LOCK-004] 검증을 통과하는 lock만 정리한다.
 
-> **[WRK-025]** 처리 중 예외 발생 시(프로세스 생존): [LOCK-005] 임계 구역에서 소유권 확인 후 자신이 소유한 `pending` Job을 `create`로 롤백하고 per-job lock을 삭제한다.
+> **[WRK-025]** 처리 중 예외 발생 시(프로세스 생존): [LOCK-005] 임계 구역에서 소유권 확인 후 자신이 소유한 `pending` Job을 `create`로 롤백하고 per-job lock을 [LOCK-004]에 따라 삭제한다.
 
 ### 5.4 Reaper 선출
 
-> **[RPR-001]** 각 Worker는 시작 60초 후부터 1분마다 Reaper 상태를 확인한다. 다음 두 조건을 모두 만족하면 현 Reaper를 유지한다: `reaper.workerId`가 `workers`에 존재 AND 해당 heartbeat가 5분 이내.
+> **[RPR-001]** 각 Worker는 시작 `REAPER_INITIAL_DELAY_MS`(기본 60,000ms) 후부터 `REAPER_CHECK_INTERVAL_MS`마다 Reaper 상태를 확인한다. 다음 두 조건을 모두 만족하면 현 Reaper를 유지한다: `reaper.workerId`가 `workers`에 존재 AND 해당 heartbeat가 5분 이내.
 
-> **[RPR-002]** Reaper가 없거나 stale이면: [LOCK-005] 임계 구역에서 최신 상태 재확인 후 `reaper.workerId = 내 workerId` 저장 → **1분 grace period 대기** → 재조회하여 여전히 자신의 ID면 Reaper 역할 시작 (eventual leader election).
+> **[RPR-002]** Reaper가 없거나 stale이면: [LOCK-005] 임계 구역에서 최신 상태 재확인 후 `reaper.workerId = 내 workerId` 저장 → **global lock을 해제한 상태로** `REAPER_ELECTION_GRACE_MS`(기본 60,000ms) 대기 → 별도 임계 구역에서 재조회하여 여전히 자신의 ID면 Reaper 역할 시작 (eventual leader election).
 
-> **[RPR-003]** Reaper는 cleanup 실행 직전마다 `reaper.workerId === workerId`를 재검증하고, 아니면 즉시 중단한다.
+> **[RPR-003]** Reaper 자격 재검증은 cleanup run 시작 시점이 아니라 **개별 복구 조치를 수행하는 global lock 임계 구역 내부**(reload 후)에서 수행한다. `reaper.workerId !== workerId`면 해당 조치와 남은 cleanup run을 즉시 중단한다.
 
 ### 5.5 Reaper cleanup
 
-> **[RPR-010]** Stale worker 정리: `heartbeatAt`이 6분 이상 갱신되지 않은 Worker를 `workers`에서 삭제한다. 자신의 heartbeat가 stale이면 cleanup을 진행하지 않는다.
+> **[RPR-010]** Stale worker 정리: `heartbeatAt`이 `WORKER_DELETE_AFTER_MS`(기본 6분) 이상 갱신되지 않은 Worker를 `workers`에서 삭제한다. 자신의 heartbeat가 stale이면 cleanup을 진행하지 않는다.
+>
+> **유예 규칙**: Reaper가 stale global lock을 삭제([RPR-012])한 직후 1회의 cleanup 주기 동안은 stale worker 삭제와 orphan lock 복구([RPR-011])를 유예한다. 장기 global lock 장애 동안 heartbeat를 갱신하지 못한 **생존** Worker를 오판하지 않기 위함이다.
 
-> **[RPR-011]** Orphan per-job lock 복구: lock의 `preemption`이 `workers`에 없으면 orphan으로 판단하고, [LOCK-005] 임계 구역에서 재검증 후 — Job이 `pending`이면 `create`로 롤백(`updatedAt = now`), Job이 `done`이거나 존재하지 않으면 상태 변경 없이 — 임계 구역 종료 후 lock 파일을 삭제한다. 살아 있는 Worker의 lock은 삭제하지 않는다.
+> **[RPR-011]** Orphan per-job lock 복구: lock의 `preemption`이 `workers`에 없으면 orphan으로 판단한다.
+>
+> - 복구 절차: [LOCK-005] 임계 구역에서 orphan 여부 재검증 → Job이 `pending`이면 `create`로 롤백(`updatedAt = now`), Job이 `done`이거나 존재하지 않으면 상태 변경 없음 → 임계 구역 종료 후 lock 파일 삭제.
+> - **lock 파일 삭제는 [LOCK-010]의 안전 삭제 절차(판정 근거 동일성 재확인)를 따른다.** 판정 시점과 내용이 달라졌으면(다른 Worker가 재획득) 삭제하지 않는다.
+> - 내용이 비었거나 파싱 불가한 lock 파일은 파일 mtime이 `REAPER_STALE_AFTER_MS`(기본 5분)를 경과하기 전에는 건드리지 않고, 경과 후 orphan으로 간주해 삭제한다.
+> - 살아 있는 Worker의 lock은 삭제하지 않는다.
 
-> **[RPR-012]** Stale global lock 복구: `jobs-global-lock.json`이 다음 중 하나면 stale 후보다 — ① `ownerType === "worker"`이고 `preemption`이 `workers`에 없음, ② `preemptedAt`이 5분 초과. metadata를 다시 읽어 동일 lock인지 확인한 뒤 삭제한다. API 소유 lock은 ②(5분 timeout)만 적용한다.
+> **[RPR-012]** Stale global lock 복구: `jobs-global-lock.json`이 다음 중 하나면 stale 후보다.
+>
+> - ① `ownerType === "worker"`이고 `preemption`이 `workers`에 없으며, **`preemptedAt`이 `GLOBAL_LOCK_ORPHAN_MIN_MS`(기본 60,000ms)를 경과**했다. (최소 경과 조건이 없으면 신규 Worker가 자기 등록을 위해 잡은 첫 lock — 아직 `workers`에 미등록 상태 — 을 오판한다.)
+> - ② `preemptedAt`이 `GLOBAL_LOCK_STALE_AFTER_MS`(기본 5분)를 초과했다. (API 소유 lock은 ②만 적용)
+>
+> 판정을 위한 읽기는 [LOCK-006]의 예외에 따라 lock-free로 수행하고, 삭제는 [LOCK-010] 절차를 따른다. [LOCK-009]에 따라 ②의 timeout 기반 복구는 Reaper가 아닌 프로세스도 수행할 수 있다.
+
+> **[RPR-013]** Pending-무lock 복구: `status === "pending"`인데 per-job lock 파일이 존재하지 않는 Job은, `updatedAt`이 `REAPER_STALE_AFTER_MS`(기본 5분)를 초과했다면 [LOCK-005] 임계 구역에서 `create`로 롤백한다(`updatedAt = now`). 이 상태는 정상 흐름에서는 발생하지 않지만, 장애 조합·샘플 데이터([DATA-004])로 도달할 수 있다.
 
 ---
 
@@ -326,12 +356,17 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 |---|---|---|
 | **[CON-001]** | 여러 Worker가 같은 Job 조회 | per-job lock exclusive create 성공자만 처리 |
 | **[CON-002]** | 특정 Job lock 실패 | 다음 `create` 후보 즉시 시도 |
-| **[CON-003]** | `jobs.json` 동시 변경 | global lock 직렬화 + 획득 후 reload |
+| **[CON-003]** | `jobs.json` 동시 변경 | global lock 직렬화 + 획득 후 reload + 원자적 rename 저장 |
 | **[CON-004]** | claim 전 상태 변경됨 | per-job lock 해제 후 다음 후보 |
 | **[CON-005]** | 완료 전 소유권 변경됨 | `done` 덮어쓰기 금지 |
 | **[CON-006]** | 처리 예외(프로세스 생존) | `pending → create` 롤백 |
 | **[CON-007]** | Worker 비정상 종료 | Reaper가 orphan lock 삭제 + 롤백 |
 | **[CON-008]** | API·Worker 동시 접근 | 모든 쓰기·일관 읽기는 global lock 경유 |
+| **[CON-009]** | lock 해제·복구 삭제 | 소유 검증([LOCK-004]) 또는 안전 삭제 절차([LOCK-010]) 필수 |
+
+### 알려진 한계 (README 기재 대상)
+
+파일 기반 잠금에는 fencing token이 없으므로, 극단적인 상황(예: lock 소유자가 stale timeout을 넘겨 정지했다가 살아나는 GC pause)에서 이중 소유를 **완전히** 배제할 수는 없다. 본 명세는 소유 검증([LOCK-004]), 원자적 rename 경유 삭제([LOCK-010]), 최소 경과 시간([RPR-012] ①), 원자적 저장([LOCK-005])으로 위험 창을 최소화한다. 강한 보장이 필요하면 DB row lock·전용 queue로 이전한다.
 
 ---
 
@@ -341,10 +376,11 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 | 설정 | 기본값 |
 |---|---:|
-| `STORAGE_DIR` | `./data` |
+| `STORAGE_DIR` | `./data` (상대 경로는 **프로젝트 루트 기준**으로 해석) |
 | `LOG_FILE_PATH` | `./logs.txt` |
 | `HEARTBEAT_INTERVAL_MS` | 60,000 |
 | `CONSUME_INTERVAL_MS` | 60,000 |
+| `REAPER_INITIAL_DELAY_MS` | 60,000 |
 | `REAPER_CHECK_INTERVAL_MS` | 60,000 |
 | `REAPER_ELECTION_GRACE_MS` | 60,000 |
 | `REAPER_STALE_AFTER_MS` | 300,000 |
@@ -352,7 +388,10 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 | `GLOBAL_LOCK_RETRY_MS` | 1,000 |
 | `GLOBAL_LOCK_API_WAIT_MS` | 5,000 |
 | `GLOBAL_LOCK_STALE_AFTER_MS` | 300,000 |
+| `GLOBAL_LOCK_ORPHAN_MIN_MS` | 60,000 |
 | `JOB_PROCESSING_MS` | 60,000 |
+
+- 제약: `WORKER_DELETE_AFTER_MS`는 `GLOBAL_LOCK_STALE_AFTER_MS`보다 커야 하며, global lock 장기 장애 시 생존 Worker 보호는 [RPR-010]의 유예 규칙이 담당한다.
 
 ---
 
@@ -378,6 +417,10 @@ data/
 
 > **[RUN-003]** 기본 Node 환경에서 `npm install` 후 별도 설정 없이 실행 가능해야 한다.
 
+> **[RUN-004]** 부트스트랩 초기화: 프로세스 기동 시 ① `STORAGE_DIR`·locks 디렉터리가 없으면 생성, ② `jobs.json`이 없으면 기본 스키마 `{ "jobs": [], "workers": {}, "reaper": { "workerId": null } }`로 생성, ③ 존재하지만 최상위 키가 누락되면 누락 키만 보정한다. ④ `jobs.json`이 파싱 불가(손상)하면 **자동으로 초기화하지 않고** 오류를 로깅하며 해당 작업을 실패 처리한다(데이터 보호 우선).
+
+> **[DOC-001]** `README.md`는 다음을 포함한다: ① 설치·실행·테스트 방법(API/Worker 별도 실행법, 다중 인스턴스 실행 예시 포함), ② 모든 엔드포인트의 요청/응답 예시, ③ 설계 코멘트(API 설계, 동시성 처리, 성능, 의도적 결정), ④ [부록 C](#부록-c-과제-해석-사항-readme-반영-대상)의 과제 해석 사항 전부, ⑤ §6의 알려진 한계.
+
 ---
 
 ## 9. 테스트 요구사항 (Stage 2 기준)
@@ -390,9 +433,10 @@ data/
 |---|---|
 | API e2e | §3의 모든 엔드포인트 × 성공/실패 케이스 (상태 코드 + 응답 본문 형식) |
 | 로깅 | HTTP 요청 로깅[LOG-003], Worker 처리 로깅[LOG-004] |
-| Storage/Lock | [LOCK-003] 원자적 생성, [LOCK-005] reload-후-저장, [LOCK-008] 대기·503 |
+| Storage/Lock | [LOCK-003] 원자적 생성, [LOCK-004] 소유 검증 해제, [LOCK-005] reload-후-저장·원자적 저장, [LOCK-008]~[LOCK-010] 대기·503·stale 복구 |
+| 초기화 | [RUN-004] 파일/디렉터리 부재·키 누락·손상 각 케이스 |
 | Worker consume | [WRK-020]~[WRK-025] claim·완료·롤백·소유권 검증 |
-| Reaper | [RPR-001]~[RPR-012] 선출·grace period·각 복구 시나리오 |
+| Reaper | [RPR-001]~[RPR-013] 선출·grace period·각 복구 시나리오(유예 규칙 포함) |
 | 동시성 | [CON-001] 두 Worker가 같은 Job을 동시에 claim 시도 → 정확히 1개만 성공 |
 
 > **[TST-002]** 테스트는 실제 시간 대기 없이 실행 가능해야 한다(fake timer 또는 주입된 clock/interval 사용).
@@ -408,6 +452,18 @@ data/
 | 3 | `logs.txt` 로깅 | 없음 | §4 전체 신설 | 과제 필수 요구사항 누락 보정 |
 | 4 | 단건 응답 형식 | `list: [job]` 허용 또는 `job` 필드 | `job` 필드로 고정 | 설계 문서 §8.6이 권장한 방향으로 확정 |
 | 5 | 샘플 데이터 | 없음 | [DATA-004] 신설 | 과제 제출 요건 |
+| 6 | lock 생성 방식 | `fs.open(path, 'wx')` 후 내용 기록 | `fs.writeFile(path, content, { flag: 'wx' })` 단일 호출 | 빈 lock 파일 관측 창 제거(2단계 비원자성 결함) |
+| 7 | lock 해제 | 파일 삭제 | 삭제 전 소유 검증([LOCK-004]) | 타 주체가 복구·재획득한 lock 오삭제 방지 |
+| 8 | stale global lock 복구 주체 | Reaper 전유 | 모든 프로세스([LOCK-009]) | Reaper 선출 자체가 global lock을 요구하므로 Reaper 전유 시 데드락. API 단독 배포에서도 복구 불가 문제 해소 |
+| 9 | stale lock 삭제 방식 | 재확인 후 삭제 | 원자적 rename 경유([LOCK-010]) | check-then-delete race로 인한 살아있는 lock 오삭제 방지 |
+| 10 | `jobs.json` 저장 | `node-json-db` save | 임시 파일 + 원자적 rename | 저장 중 crash 시 단일 공유 파일 손상 방지 |
+| 11 | Reaper 오판 방지 | worker registry 부재만으로 판정 | `GLOBAL_LOCK_ORPHAN_MIN_MS` 최소 경과 조건 추가([RPR-012] ①) | 신규 Worker의 등록용 첫 lock(아직 registry 미등록)을 오판·삭제하는 결함 보정 |
+| 12 | Reaper 자격 재검증 시점 | cleanup 실행 직전 | 개별 조치의 임계 구역 내부([RPR-003]) | 긴 cleanup run 중 Reaper 교체 시 이중 Reaper 동작 방지 |
+| 13 | 정상 종료 시 보유 Job | "안전하게 완료하거나 롤백" | 항상 `create` 롤백([WRK-004]) | 비결정적 규칙은 테스트 불가 |
+| 14 | 빈/파싱불가 lock 처리 | §17에 보조 정보로만 언급 | [RPR-011]에 mtime 기준 규칙로 명세화 | 판정 불능으로 인한 영구 잔존/오삭제 방지 |
+| 15 | pending-무lock Job | 규칙 없음 | [RPR-013] 신설 | 복구 경로 부재 시 영구 pending 고착(샘플 데이터 포함) |
+| 16 | storage 경로 | 절대 경로 전달 필수 | 상대 경로는 프로젝트 루트 기준 해석 | `npm install` 후 무설정 실행([RUN-003])과의 정합 |
+| 17 | stale global lock 삭제 후 | 규칙 없음 | 1 주기 유예([RPR-010]) | lock 장애로 heartbeat 기아 상태였던 생존 Worker 오판 방지 |
 
 ## 부록 B. 초기설계 대비 확정 사항
 
@@ -418,7 +474,7 @@ data/
 | `pending` 의미 | 처리 대기중 | **처리 중(선점됨)** — README에 해석 명시 |
 | POST 성공 상태 | 200 | **201 Created** (HTTP 시맨틱) |
 | job lock 획득 실패 시 | 1분 대기 후 재시도 | **다음 후보 즉시 시도** |
-| global lock 경합(API) | 삭제 대기만 정의 | Worker 1초 재시도 / API 5초 timeout 후 503 |
+| global lock 경합(API) | 삭제 대기만 정의 | 1초 간격 재시도, 누적 5초 초과 시 503 |
 
 ## 부록 C. 과제 해석 사항 (README 반영 대상)
 
@@ -426,3 +482,4 @@ data/
 2. "제목/상태로 검색"은 `title`·`status` 쿼리 파라미터로 구현하고, 설계 확장으로 `description`도 지원한다.
 3. 처리 주기(1분)와 한 번에 처리할 단위(Worker당 1건)는 과제가 허용한 자유 가정이다.
 4. 응답 본문에 `status`(HTTP 코드 미러링)와 `result`(성공/사유)를 두는 형식은 자유 설계 항목이다.
+5. **스케줄러는 별도 Worker 프로세스로 분리 실행**한다(`start:api` / `start:worker`). API만 실행하면 작업 처리가 일어나지 않으며, 처리 확인에는 두 프로세스의 동시 기동이 필요하다. API·Worker 모두 다중 인스턴스 실행을 지원하기 위한 결정이다.
