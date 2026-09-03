@@ -48,12 +48,16 @@
 
 ```json
 {
+  "version": 42,
   "jobs": [
     {
       "id": "550e8400-e29b-41d4-a716-446655440000",
       "title": "lorem ipsum",
       "description": "lorem ipsum",
       "status": "create",
+      "owner": null,
+      "attemptId": null,
+      "leaseUntil": null,
       "createdAt": "2026-09-03T20:00:00.000Z",
       "updatedAt": "2026-09-03T20:00:00.000Z"
     }
@@ -66,6 +70,9 @@
 }
 ```
 
+최상위 키는 `version`, `jobs`, `workers`, `reaper`, `config` 다섯 개다.
+
+- `version`: 단조 증가하는 상태 버전. 모든 커밋은 이 값을 근거로 CAS를 수행한다([LOCK-012]).
 - `config.fingerprint`: 프로세스 간 합의가 필요한 타이밍 설정의 해시([CFG-002]). 부트스트랩에서 비교해 불일치를 차단한다.
 
 > **[DATA-002]** Job 필드 규칙:
@@ -76,10 +83,14 @@
 | `title` | string | 필수. trim(앞뒤 공백 제거) 후 1자 이상, **최대 1,000자** |
 | `description` | string | 필수. trim 후 1자 이상, **최대 2,000자** |
 | `status` | enum | `create` \| `pending` \| `done` |
+| `owner` | 64-hex \| `null` | 현재 선점한 Worker ID. `pending`일 때만 non-null |
+| `attemptId` | 32-hex \| `null` | **이 선점 시도**의 고유 토큰. 같은 Worker의 재시도끼리도 서로 다르다 |
+| `leaseUntil` | ISO 8601 UTC \| `null` | 선점 만료 시각. 경과하면 다른 주체가 회수할 수 있다 |
 | `createdAt` | ISO 8601 UTC | 생성 시각. 불변 |
 | `updatedAt` | ISO 8601 UTC | 마지막 변경 시각 |
 
 - `title`·`description`은 **trim된 값을 저장**하며, 길이 제한도 trim 후 값 기준으로 판정한다.
+- `owner`·`attemptId`·`leaseUntil`은 **소유권을 레코드 자체에 담아 CAS로 검증**하기 위한 필드다([LOCK-013]). lock **파일**은 값싼 1차 배타 장치일 뿐이며, 소유권의 근거가 아니다.
 
 > **[DATA-003]** 모든 시각은 ISO 8601 UTC(`...Z`) 문자열로 기록·비교한다.
 
@@ -111,7 +122,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 > |---|---|---|
 > | `{uuid}-lock.json` | per-job lock | `{uuid}`는 **UUID 형식이어야 한다** |
 > | `jobs-global-lock.json` | global lock | **예약 파일명** |
-> | `*.stale-*`, `*.release-*`, `*.tmp` | 절차상 임시 파일 | lock 아님. [RPR-011]이 청소 |
+> | `*.tmp` | CAS 재시도로 버려진 임시 파일 | lock 아님. [RPR-015]가 청소 |
 >
 > per-job lock 스캔은 `{uuid}-lock.json` 패턴 **AND** `{uuid}`가 UUID 형식인 파일만 대상으로 하며, 예약 파일명은 명시적으로 제외한다. `jobs-global-lock.json`이 `{jobId}-lock.json` 패턴(`jobId = "jobs-global"`)에 매칭되어 per-job lock으로 오인되면 살아있는 global lock이 orphan으로 삭제되므로, 이 구분은 안전성 요구사항이다.
 
@@ -139,21 +150,39 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 >
 > 이 규칙이 없으면 빈 `jobs-global-lock.json`은 `preemptedAt`을 평가할 수 없어 어떤 stale 판정도 통과하지 못하고, Worker는 무기한 대기·API는 영구 503이 된다.
 
-> **[LOCK-004]** 정상 해제는 소유자만 수행한다.
+> **[LOCK-004]** 정상 해제: canonical 경로의 lock 파일을 읽어 `preemption`이 자신의 Process ID와 **일치할 때만** `unlink`한다. 파일이 없거나 `preemption`이 다르면 아무것도 하지 않고 WARN을 로깅한다.
 >
-> 1. canonical 경로의 lock 파일을 **먼저 읽는다**. 파일이 없거나 `preemption`이 자신의 Process ID와 다르면 **아무것도 건드리지 않고 중단**하고 오류를 로깅한다.
-> 2. 자신의 lock임을 확인했으면 `rename(lockPath, lockPath + '.release-' + myProcessId + '-' + nonce)`를 시도한다. `ENOENT`면 그 사이 회수된 것이므로 중단한다.
-> 3. rename된 파일을 다시 읽어 `preemption`이 여전히 자신의 것인지 확인한다. 일치하면 삭제한다. 일치하지 않으면 [LOCK-011]의 복원 절차로 되돌린다.
->
-> **1단계(선행 읽기)가 없으면 비소유자 경로가 파괴적이 된다**: 소유권 확인 전에 rename하면 타 프로세스가 정당하게 보유·재획득한 lock이 canonical 경로에서 사라지고, 그 창에서 제3자가 `wx`로 생성에 성공하면 [LOCK-011] 복원이 `EEXIST`로 실패해 원 소유자의 lock이 영구 소실된다. 1단계로 이 경로 자체를 제거하며, 2~3단계의 재확인이 TOCTOU를 계속 막는다.
+> 읽기와 `unlink` 사이에는 TOCTOU 창이 남는다 — 그 사이 lock이 회수되고 다른 프로세스가 재획득했다면 살아있는 lock을 지울 수 있다. **이 창은 rename·복원 절차로 닫을 수 없다**: 읽어서 판정한 *파일 identity*와 나중에 조작하는 *pathname*을 원자적으로 결속하는 POSIX 연산이 없기 때문이다(자세한 근거는 [LOCK-012] 아래 설명). 따라서 본 명세는 이 창을 **닫으려 하지 않고, 무해하게 만든다**: lock을 빼앗긴 프로세스는 [LOCK-012]의 CAS에서 커밋이 거부되고 재시도하므로, 피해는 지연으로 한정되고 데이터 손상은 발생하지 않는다.
 
-> **[LOCK-005]** 모든 `jobs.json` 변경은 다음 순서를 지킨다: `global lock 획득 → jobs.json을 디스크에서 reload → 조건 재검증 → 변경 → 저장 → global lock 해제`. `node-json-db` 인메모리 캐시로 덮어쓰는 것을 금지한다(획득 후 reload 필수).
+> **[LOCK-005]** 모든 `jobs.json` 변경은 다음 순서를 지킨다: `global lock 획득 → jobs.json을 디스크에서 reload → 조건 재검증 → 변경 → [LOCK-012]의 CAS 커밋 → global lock 해제`. `node-json-db` 인메모리 캐시로 덮어쓰는 것을 금지한다(획득 후 reload 필수).
 >
-> **저장은 임시 파일에 기록한 뒤 원자적 rename으로 `jobs.json`을 교체**한다. 저장 도중 crash가 나도 기존 파일이 손상되지 않아야 한다. 임시 파일명에는 **Process ID와 난수를 포함**하여 프로세스 간 충돌을 방지한다(예: `jobs.json.<processId>.<random>.tmp`).
->
-> `node-json-db`는 데이터 파싱·조작·reload에 사용하되, 디스크 저장은 위 원자적 persist로 수행한다(자체 save 경로의 비원자성 우회 — README에 사유 기재).
+> `node-json-db`는 데이터 파싱·조작·reload에 사용하되, 디스크 게시는 [LOCK-012]로 수행한다(자체 save 경로는 비원자적이며 CAS를 제공하지 않는다 — README에 사유 기재).
 
-> **[LOCK-006]** 일관된 snapshot이 필요한 읽기(목록/검색/단건 조회, Worker 후보 조회)도 동일한 global lock 임계 구역에서 수행한다. **예외**: [LOCK-009]/[RPR-012]의 stale 판정을 위한 lock 파일·`jobs.json` 읽기는 global lock 없이 수행한다(판정 대상이 global lock 자신이므로).
+> **[LOCK-012]** (버전 CAS 커밋 — **안전성의 근거**) `jobs.json`의 모든 커밋은 읽어들인 `version`을 조건으로 하는 compare-and-swap이다.
+>
+> 1. 트랜잭션 시작 시 읽은 상태의 `version`을 `N`으로 기억한다.
+> 2. 변경된 상태에 `version = N + 1`을 기록하고 유일한 임시 파일(`jobs.json.<processId>.<random>.tmp`)에 완전히 쓴 뒤 `fsync`한다.
+> 3. **CAS**: `fs.link(tmpPath, {STORAGE_DIR}/versions/v{N+1}.json)`을 시도한다.
+>    - `EEXIST` → 다른 프로세스가 이미 `N+1`을 커밋했다. **자신의 커밋을 버리고** 임시 파일을 삭제한 뒤 트랜잭션 전체를 재시도한다(reload → 조건 재검증 → 재적용).
+>    - 성공 → 이 프로세스가 `N → N+1` 전이의 **유일한 승자**다.
+> 4. 승자는 `rename(tmpPath, jobsJsonPath)`로 현재 상태를 게시한다. `rename`은 원자적이므로 독자는 항상 완전한 JSON을 읽는다.
+> 5. 재시도는 `CAS_MAX_RETRIES`(기본 10)까지 수행하고, 초과하면 API는 `503`, Worker는 해당 tick을 포기하고 오류를 로깅한다.
+>
+> `fs.link`는 목적지가 존재하면 `EEXIST`로 **실패**하는 원자적 연산이므로, 각 버전 전이마다 승자가 정확히 한 명임이 파일시스템 수준에서 보장된다. 따라서 **global lock이 동시에 두 프로세스에게 보유되는 상황이 발생해도 lost update는 불가능하다** — 패자는 CAS에서 거부되고 최신 상태로 재시도한다.
+>
+> **왜 잠금만으로는 부족한가**: 이전 판은 "stale lock을 rename으로 배타 이동하므로 회수 경쟁이 직렬화된다"고 규정했으나 이는 성립하지 않는다. 회수자 A가 stale lock을 rename한 직후 canonical 경로는 **비어 있고**, 그 틈에 정상 프로세스 N이 `wx`로 새 lock을 획득하면, 뒤늦게 도착한 회수자 B의 rename은 `ENOENT`가 아니라 **N의 살아있는 lock을 이동시킨다**. 다시 빈 경로에 M이 획득해 N과 M이 동시에 임계 구역을 실행한다. B의 사후 재판정과 복원은 이미 늦으며 복원도 `EEXIST`로 실패한다. 같은 구조가 [LOCK-004]의 해제에도 존재한다. 즉 pathname 기반 `read → 조작` 프로토콜로는 lock 탈취를 배제할 수 없다. 본 명세는 그 사실을 인정하고, **정확성을 잠금의 배타성에서 버전 CAS로 이전**한다.
+>
+> `versions/` 디렉터리는 [RPR-015]가 정리한다.
+
+> **[LOCK-013]** (선점 토큰) Job의 선점 소유권은 lock 파일이 아니라 **레코드의 `owner`·`attemptId`·`leaseUntil`** 로 표현하며, 모든 전이는 [LOCK-012]의 CAS 안에서 이 세 값을 조건으로 검증한다.
+>
+> - `attemptId`는 **선점 시도마다 새로 생성**한다. 같은 Worker가 timeout 후 재시도해도 값이 달라진다.
+> - 따라서 timeout·정지 후 되살아난 옛 시도는 CAS 조건(`attemptId` 일치)에서 걸러지며, **같은 `workerId`를 쓰는 자신의 다음 시도가 만든 선점을 자기 것으로 오인할 수 없다**.
+> - `leaseUntil`이 경과한 선점은 소유자의 생존 여부와 무관하게 회수 대상이다([RPR-011]).
+
+> **[LOCK-006]** 일관된 snapshot이 필요한 읽기(목록/검색/단건 조회, Worker 후보 조회)는 `jobs.json`을 한 번 읽는 것으로 충분하다 — [LOCK-012] 4단계의 원자적 게시 덕분에 항상 완전한 상태를 얻는다. 쓰기를 수반하지 않는 조회는 global lock을 획득하지 않아도 된다.
+>
+> global lock은 **경합을 줄이기 위한 효율 장치**이며, 정확성은 [LOCK-012]가 담당한다. stale 판정을 위한 lock 파일·`jobs.json` 읽기도 global lock 없이 수행한다.
 
 > **[LOCK-007]** 잠금 획득 순서는 **per-job lock → global lock**이다. global lock을 보유한 채 per-job lock을 획득하지 않는다. global lock을 보유한 채 장시간 처리·sleep을 하지 않는다.
 
@@ -161,18 +190,21 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 >
 > 파일 잠금 재시도에는 큐도 공정성도 없으므로, 특정 Worker가 오랫동안 `wx` 경쟁에 밀리는 **경합 기아**가 가능하다. 이때 heartbeat 갱신([WRK-010])도 같은 global lock을 필요로 하므로 살아있는 Worker가 자기 생존을 알리지 못하고 Reaper에게 stale로 오판될 수 있다. 이 오판이 데이터 손상으로 이어지지 않게 하는 것은 Reaper 쪽 유예 heuristic이 아니라 **Worker 쪽 self-fencing([WRK-012])** 이다. 기아 자체를 완화하기 위해 재시도 간격에는 `GLOBAL_LOCK_RETRY_MS`의 ±50% 지터를 적용한다.
 
-> **[LOCK-009]** (stale global lock 복구 — 모든 프로세스) global lock 획득 시도 중 기존 lock 파일이 [RPR-012]의 stale 조건 또는 [LOCK-003-a]의 빈·파싱 불가 조건에 해당하면, **API·Worker 어떤 프로세스든** [LOCK-010] 절차로 해당 lock을 회수한 뒤 획득을 재시도할 수 있다. Reaper가 없는 배포(API 단독 실행)에서도 영구 정지가 발생하지 않기 위한 규칙이다.
-
-> **[LOCK-010]** (stale lock 회수 절차) stale로 판정한 lock의 회수는 **plain unlink를 절대 사용하지 않고** 다음 순서로 수행한다. 별도의 조정용 mutex는 두지 않는다 — 2단계의 rename 자체가 회수 경쟁을 직렬화한다.
+> **[LOCK-009]** (stale lock 회수 — 모든 프로세스) lock 파일이 아래 조건 중 하나를 만족하면 **API·Worker 어떤 프로세스든** [LOCK-010] 절차로 회수할 수 있다. Reaper가 없는 배포(API 단독 실행)에서도 영구 정지가 발생하지 않기 위한 규칙이다.
 >
-> 1. **판정**: 대상 lock 파일을 읽어 stale 조건([RPR-012] 또는 [LOCK-003-a])이 성립하는지 확인한다. 성립하지 않으면 중단한다. 판정 근거(`preemption`, `preemptedAt`, 빈 파일이면 mtime)를 기록한다.
-> 2. **배타적 이동**: `rename(lockPath, lockPath + '.stale-' + myProcessId + '-' + nonce)`를 시도한다. 같은 원본에 대한 rename은 **정확히 하나만 성공**하며 나머지는 `ENOENT`로 실패한다. 실패하면 다른 프로세스가 이미 회수를 진행한 것이므로 중단하고 획득 루프로 돌아간다.
-> 3. **이동 후 재판정**: 이제 대상 파일을 **배타적으로 점유**한 상태다. 파일을 다시 읽어 1의 판정 근거와 동일한지 확인한다.
-> 4. 동일하면 삭제한다(회수 완료). 다르면(판정 이후 원 소유자가 해제하고 다른 프로세스가 새 lock을 게시한 경우) [LOCK-011]의 복원 절차로 되돌린다.
+> | 대상 | 회수 조건 |
+> |---|---|
+> | global lock | [RPR-012] ①·② |
+> | per-job lock | 대응 Job의 `leaseUntil`이 경과했거나 Job이 존재하지 않거나 `status !== "pending"`이면서 lock의 `preemptedAt`이 `JOB_LEASE_MS`를 경과 |
+> | 모든 lock | [LOCK-003-a]의 빈·파싱 불가 조건 |
 >
-> **왜 mutex가 아니라 rename인가**: 이전 판이 사용한 "reap-mutex를 `wx`로 잡고 그 안에서 회수" 방식은 ⓐ mutex 자체의 `read → unlink → wx` 경로에 동일한 check-then-delete race가 생기고(두 프로세스가 모두 획득 성공), ⓑ mutex가 누출되면 회수 기능이 영구 정지하고, ⓒ 절차 중단 경로마다 해제 누락이 생겨, 막으려던 문제보다 더 많은 실패 모드를 만들었다. rename 기반 회수는 배타성을 파일시스템 원자성에서 직접 얻으므로 이 세 문제가 모두 사라진다. 회수 도중 프로세스가 죽어도 남는 것은 `*.stale-*` 잔존 파일뿐이며 [RPR-011]이 mtime 기준으로 청소한다.
+> per-job lock의 회수 조건을 `leaseUntil` 기준으로 두는 이유는 [LOCK-013]에 따라 **소유권의 근거가 레코드이기 때문**이다. lock 파일 회수는 재선점을 가능하게 하는 청소 작업이며, 상태 전이 자체는 [RPR-011]이 CAS로 수행한다.
 
-> **[LOCK-011]** (no-replace 복원 절차) rename으로 옮겨둔 lock 파일을 원래 경로로 되돌릴 때는 `rename`을 사용하지 않는다 — Node.js `fs.rename`은 목적지가 존재해도 조용히 덮어쓰므로, 그 사이 다른 프로세스가 `wx`로 생성한 살아있는 lock을 파괴할 수 있다. 대신 `fs.link(movedPath, lockPath)`(목적지 존재 시 `EEXIST` 보장)를 시도하고, 성공하면 `movedPath`를 삭제한다. `EEXIST`면(새 lock이 이미 생성됨) 복원을 포기하고 `movedPath`를 삭제한 뒤 경고를 로깅한다.
+> **[LOCK-010]** (stale lock 회수 절차) 1단계에서 [LOCK-009]의 조건 성립을 확인하고, 2단계에서 `unlink`한다.
+>
+> 이 절차는 **살아있는 lock을 빼앗을 수 있다** — 판정과 `unlink` 사이에 원 소유자가 해제하고 다른 프로세스가 재획득할 수 있으며, 이 창을 pathname 조작으로 닫을 방법은 없다([LOCK-012] 참조). 이전 판의 rename-to-sideline과 그 이전의 reap-mutex는 모두 이 창을 닫으려는 시도였고, 둘 다 실패했다(각각 "빈 canonical 경로에 새 lock이 생성된 뒤 뒤늦은 rename이 그것을 이동", "mutex 자체의 check-then-delete race").
+>
+> 본 명세는 이 창을 **무해하게 만드는 쪽**을 택한다: lock을 빼앗긴 프로세스의 커밋은 [LOCK-012]의 CAS 또는 [LOCK-013]의 토큰 검증에서 거부되므로, 결과는 재시도 지연이며 데이터 손상이 아니다. 이 선택 덕분에 rename 왕복·복원 절차·조정용 mutex·잔존 파일 청소 규칙이 모두 불필요해졌다.
 
 ---
 
@@ -279,7 +311,7 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 > status === "create"  AND  해당 Job의 per-job lock 파일이 없음
 > ```
 >
-> per-job lock 생성과 `pending` 저장 사이의 시간차 때문에 상태와 lock 파일을 **모두** 확인한다. 검사와 수정은 [LOCK-005] 임계 구역에서 최신 데이터를 reload한 뒤 수행한다.
+> per-job lock 생성([WRK-021] 2단계)과 `pending` 커밋(5단계) 사이의 시간차 때문에 상태와 lock 파일을 **모두** 확인한다. 검사와 수정은 [LOCK-005] 임계 구역에서 reload 후 수행하고, [LOCK-012]의 CAS로 커밋한다 — 조건 검사와 커밋 사이에 Worker의 claim이 끼어들면 CAS가 실패하므로 재시도 시 최신 상태로 재검사된다.
 
 > **[API-052]** 성공 시 `updatedAt`을 갱신하고 수정된 Job을 `job` 필드로 반환한다.
 
@@ -366,10 +398,16 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 > **[WRK-020]** 후보 조회: [LOCK-006] snapshot에서 `status === "create"`인 Job을 `createdAt` ASC, 동률 시 `id` ASC로 정렬한다.
 
 > **[WRK-021]** Claim 절차 (후보별):
-> 1. `{jobId}-lock.json`을 [LOCK-003]에 따라 내용(`preemption = workerId`, `preemptedAt = now`)과 함께 단일 호출로 생성 시도. `EEXIST`면 **즉시 다음 후보로 이동**(대기 금지).
-> 2. [LOCK-005] 임계 구역에서 해당 Job이 여전히 `create`인지 재검증.
-> 3. `create`가 아니면 per-job lock을 [LOCK-004]에 따라 삭제 후 다음 후보로 이동.
-> 4. `create`면 `status = "pending"`, `updatedAt = now`로 저장하고 임계 구역을 빠져나온 뒤 처리를 시작한다.
+> 1. 이 시도의 `attemptId`(32-hex 난수)를 생성한다.
+> 2. `{jobId}-lock.json`을 [LOCK-003] 절차로 생성 시도하며 내용에 `preemption = workerId`, `attemptId`, `preemptedAt = now`를 기록한다. `EEXIST`면 **즉시 다음 후보로 이동**(대기 금지).
+> 3. [LOCK-005] 임계 구역에서 다음 **CAS 조건 전체**를 재검증한다.
+>    - Job이 여전히 `status === "create"`이다.
+>    - `workers[workerId]`가 존재한다([WRK-012]).
+>    - **canonical per-job lock 파일이 여전히 존재하며 그 `attemptId`가 이 시도의 값과 같다.**
+> 4. 하나라도 어긋나면 claim을 포기하고, 자신의 lock인 경우에만 [LOCK-004]로 해제한 뒤 다음 후보로 이동한다.
+> 5. 모두 만족하면 `status = "pending"`, `owner = workerId`, `attemptId`, `leaseUntil = now + JOB_LEASE_MS`, `updatedAt = now`를 [LOCK-012]의 CAS로 커밋하고, 임계 구역을 빠져나온 뒤 처리를 시작한다.
+>
+> **3단계의 lock 재검증이 없으면 lock 없이 처리하는 경로가 생긴다**: Worker가 lock을 먼저 잡고 global lock을 기다리는 사이 대기가 `JOB_LEASE_MS`를 넘기면 [RPR-011]이 그 lock을 회수할 수 있다. 이후 Worker가 global lock을 얻었을 때 Job 상태와 registry만 확인하면, 자기 lock이 이미 사라졌다는 사실을 모른 채 `pending`으로 전이시키고 처리를 시작한다. self-fencing 기준(5분)이 lease(2분)보다 길어 정상 구성에서도 재현된다.
 
 > **[WRK-022]** 다음 경우에만 다음 tick까지 대기한다: `create` Job이 없음 / 모든 후보의 lock 획득 실패 / 재검증 결과 모든 후보가 `create`가 아님.
 
@@ -377,11 +415,30 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 
 > **[WRK-026]** consume tick 전체에 `CONSUME_TIMEOUT_MS`(기본 `2 × JOB_PROCESSING_MS`) 상한을 둔다. 초과하면 [WRK-025]의 롤백 경로로 보내고, **어떤 경우에도 `isConsuming` guard를 해제**한다.
 >
-> 상한이 없으면 consume 경로가 예외 없이 hang하는 경우(무기한 global lock 대기, NFS I/O 정지 등) [WRK-025]의 롤백이 발동하지 않고 `isConsuming`도 풀리지 않아, 해당 Worker가 이후 어떤 Job도 처리하지 않고 조용히 풀에서 이탈한다. Worker가 1대인 배포에서는 전체 처리가 멈춘다. Job 쪽 고착은 [RPR-014]가 함께 처리한다.
+> 상한이 없으면 consume 경로가 예외 없이 hang하는 경우(무기한 global lock 대기, NFS I/O 정지 등) [WRK-025]의 롤백이 발동하지 않고 `isConsuming`도 풀리지 않아, 해당 Worker가 이후 어떤 Job도 처리하지 않고 조용히 풀에서 이탈한다. Worker가 1대인 배포에서는 전체 처리가 멈춘다.
+>
+> **timeout은 취소가 아니다.** Promise timeout은 진행 중인 retry·I/O·처리 callback을 중단시키지 못하므로, 다음 두 장치를 함께 요구한다.
+>
+> - **협조적 취소**: consume 시도마다 `AbortSignal`(또는 동등한 취소 플래그)을 만들어 하위 대기 루프(global lock 재시도, `processJob`, lease 갱신)에 전달한다. 각 루프는 매 반복마다 신호를 확인하고 즉시 종료한다.
+> - **generation guard**: 되살아난 옛 시도가 어떤 mutation 경로에도 진입하지 못하도록, 모든 커밋은 [LOCK-013]의 `attemptId`를 CAS 조건으로 검증한다([WRK-024]/[WRK-025]/[WRK-027]). 취소가 늦더라도 커밋은 구조적으로 거부된다.
 
-> **[WRK-024]** 완료 절차: [LOCK-005] 임계 구역에서 ① `status === "pending"` 재확인, ② per-job lock의 `preemption === workerId` 재확인 → 모두 만족 시 `status = "done"`, `updatedAt = now` 저장 → 임계 구역 종료 후 per-job lock을 [LOCK-004]에 따라 삭제. 소유권 검증 실패 시 `done`으로 **덮어쓰지 않고** 오류를 로깅하며, [LOCK-004] 검증을 통과하는 lock만 정리한다.
+> **[WRK-024]** 완료 절차: [LOCK-005] 임계 구역에서 다음 **CAS 조건 전체**를 재확인한다.
+>
+> - `status === "pending"`
+> - `owner === workerId`
+> - **`attemptId === 이 시도의 attemptId`** ([LOCK-013])
+> - `leaseUntil > now`
+> - `workers[workerId]` 존재 ([WRK-012])
+>
+> 모두 만족하면 `status = "done"`, `owner/attemptId/leaseUntil = null`, `updatedAt = now`를 [LOCK-012]의 CAS로 커밋하고, 임계 구역 종료 후 [LOCK-004]로 per-job lock을 해제한다. 하나라도 어긋나면 `done`으로 **덮어쓰지 않고** 오류를 로깅하며, 자신의 것으로 검증되는 lock만 정리한다.
+>
+> **`workerId`만 검사하면 안 되는 이유**: [WRK-026]의 timeout은 진행 중인 I/O·retry를 자동 취소하지 못하므로, timeout된 옛 시도 A가 나중에 되살아날 수 있다. 그 사이 같은 Worker의 다음 시도 B가 같은 Job을 다시 선점했다면, `workerId`만 보는 A는 **B의 선점을 자기 것으로 오인**해 `done`으로 커밋하고 B의 lock까지 해제한다. `attemptId`가 시도마다 달라 이 경로가 차단된다.
 
-> **[WRK-025]** 처리 중 예외 발생 시(프로세스 생존): [LOCK-005] 임계 구역에서 소유권 확인 후 자신이 소유한 `pending` Job을 `create`로 롤백하고 per-job lock을 [LOCK-004]에 따라 삭제한다.
+> **[WRK-025]** 처리 중 예외 발생 시(프로세스 생존): [LOCK-005] 임계 구역에서 [WRK-024]와 **동일한 CAS 조건**(`owner` + `attemptId` + `leaseUntil` + registry)을 확인한 뒤, 자신의 시도가 소유한 `pending` Job을 `create`로 롤백(`owner/attemptId/leaseUntil = null`)하고 [LOCK-004]로 per-job lock을 해제한다. 조건이 어긋나면 아무것도 되돌리지 않는다.
+
+> **[WRK-027]** Lease 갱신: 처리 중인 Worker는 `LEASE_RENEW_INTERVAL_MS`(기본 `JOB_LEASE_MS / 3`)마다 [WRK-024]와 동일한 CAS 조건 아래 `leaseUntil = now + JOB_LEASE_MS`로 연장한다. 갱신이 실패하면(조건 불일치 = 선점을 잃음) 처리를 즉시 중단하고 커밋을 시도하지 않는다.
+>
+> 갱신이 없으면 `JOB_PROCESSING_MS`가 `JOB_LEASE_MS`에 가까운 설정에서 정상 처리 중인 Job이 회수된다. 갱신 실패를 중단 신호로 쓰면, 선점을 잃은 Worker가 헛되게 처리를 이어가지 않는다.
 
 ### 5.4 Reaper 선출
 
@@ -399,17 +456,20 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 >
 > 이전 판에 있던 "stale global lock 회수 직후 1주기 유예" 규칙은 **삭제**했다. 그 규칙은 회수 사실을 `jobs.json`에 영속화해야 동작했는데, 회수와 기록 사이가 원자적이지 않아 ⓐ 기록 전 crash 시 공백, ⓑ 같은 프로세스의 중첩 cleanup이 자기 소유 mutex 예외로 가드를 우회, ⓒ Reaper 교체 시 유예 인지 실패 등 새 실패 모드를 만들었다. 유예가 보호하려던 대상(경합 기아 상태의 생존 Worker)은 이제 [WRK-012] self-fencing이 **오판 자체와 무관하게** 보호한다.
 
-> **[RPR-011]** Orphan per-job lock 복구: 다음 **두 조건을 모두** 만족하면 orphan으로 판단한다.
+> **[RPR-011]** 만료 선점 복구 (lease 기반 — 이전 판의 orphan lock 복구와 별도 처리 lease 규칙을 통합):
 >
-> - lock의 `preemption`이 `workers`에 없다.
-> - **`preemptedAt` 경과가 `WORKER_DELETE_AFTER_MS`를 초과**했다(빈·파싱 불가 lock은 [LOCK-003-a]에 따라 mtime 기준).
+> - **판정**: `status === "pending"`이면서 `leaseUntil <= now`인 Job. 소유자의 `workers` 등록 여부는 판정에 쓰지 않는다 — 소유권의 근거는 레코드이고([LOCK-013]) lease 만료는 그 자체로 충분한 조건이다.
+> - **복구**: [LOCK-005] 임계 구역에서 `status === "pending" AND attemptId === 판정 당시의 attemptId AND leaseUntil <= now`를 CAS 조건으로 확인한 뒤 `create`로 롤백하고 `owner/attemptId/leaseUntil = null`, `updatedAt = now`로 커밋한다. 조건이 어긋나면(소유자가 그 사이 lease를 갱신했거나 완료했다면) 아무것도 하지 않는다.
+> - **lock 파일 청소**: 롤백 후 대응 per-job lock 파일을 [LOCK-010]으로 회수한다. 회수가 실패하거나 살아있는 lock을 빼앗아도 정확성에는 영향이 없다([LOCK-010] 참조).
+> - lock 스캔 대상은 [LOCK-000]의 per-job lock 패턴을 만족하는 파일만이다. 예약 파일명(`jobs-global-lock.json`)은 lock으로 취급하지 않는다.
 >
-> 최소 경과 조건은 [RPR-012]①과 동일한 이유로 필요하다. registry 부재만으로 판정하면, 경합 기아나 신규 등록 지연으로 일시적으로 `workers`에 없는 **살아있는** Worker의 lock을 즉시 orphan으로 판정해 처리 중인 Job을 롤백하고 중복 실행을 유발한다.
+> registry 부재를 판정 조건에서 뺀 것은 의도적이다. registry는 경합 기아·신규 등록 지연으로 살아있는 Worker에게도 일시적으로 비어 있을 수 있어 오판원이 되지만, `leaseUntil`은 소유자가 [WRK-027]로 직접 갱신하는 값이므로 생존의 직접적 증거다.
+
+> **[RPR-015]** 잔존 파일 청소:
 >
-> - 복구 절차: [LOCK-005] 임계 구역에서 orphan 여부 재검증 → Job이 `pending`이면 `create`로 롤백(`updatedAt = now`), Job이 `done`이거나 존재하지 않으면 상태 변경 없음 → 임계 구역 종료 후 [LOCK-010] 절차로 lock 파일을 회수한다.
-> - 살아 있는 Worker의 lock은 회수하지 않는다(단, [RPR-014]의 lease 만료는 예외).
-> - lock 스캔 대상은 [LOCK-000]의 per-job lock 패턴을 만족하는 파일만이다. 예약 파일명(`jobs-global-lock.json`)과 절차상 임시 파일(`*.stale-*`, `*.release-*`, `*.tmp`)은 lock으로 취급하지 않는다.
-> - **잔존 파일 청소**: mtime이 `REAPER_STALE_AFTER_MS`를 경과한 `*.stale-*`, `*.release-*`, `*.tmp` 파일을 `{STORAGE_DIR}/locks/`와 `{STORAGE_DIR}`(저장용 `jobs.json.*.tmp` 포함) 양쪽에서 삭제한다.
+> - mtime이 `REAPER_STALE_AFTER_MS`를 경과한 `*.tmp` 파일을 `{STORAGE_DIR}`와 `{STORAGE_DIR}/locks/`에서 삭제한다(CAS 재시도로 버려진 임시 파일).
+> - `{STORAGE_DIR}/versions/`에서 현재 `version`보다 `VERSION_KEEP_COUNT`(기본 5)개 이상 오래된 버전 파일을 삭제한다. 최신 몇 개를 남기는 이유는 진행 중인 CAS 시도가 참조할 수 있기 때문이다.
+> - 청소는 파괴적 복구가 아니므로 [RPR-003]의 자격 재검증과 무관하게 수행할 수 있다.
 
 > **[RPR-012]** Stale global lock 복구: `jobs-global-lock.json`이 다음 중 하나면 stale 후보다.
 >
@@ -417,13 +477,9 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 > - ② `preemptedAt`이 `GLOBAL_LOCK_STALE_AFTER_MS`(기본 5분)를 초과했다. (API 소유 lock은 ②만 적용)
 > - ③ [LOCK-003-a]의 빈·파싱 불가 조건을 만족한다.
 >
-> 판정을 위한 읽기는 [LOCK-006]의 예외에 따라 lock-free로 수행하고, 회수는 [LOCK-010] 절차를 따른다. [LOCK-009]에 따라 ②·③의 복구는 Reaper가 아닌 프로세스도 수행할 수 있다.
+> 판정을 위한 읽기는 lock-free로 수행하고, 회수는 [LOCK-010] 절차를 따른다. [LOCK-009]에 따라 ②·③의 복구는 Reaper가 아닌 프로세스도 수행할 수 있다.
 
-> **[RPR-013]** Pending-무lock 복구: `status === "pending"`인데 per-job lock 파일이 존재하지 않는 Job은, `updatedAt`이 `REAPER_STALE_AFTER_MS`(기본 5분)를 초과했다면 [LOCK-005] 임계 구역에서 `create`로 롤백한다(`updatedAt = now`). 이 상태는 정상 흐름에서는 발생하지 않지만, 장애 조합·샘플 데이터([DATA-004])로 도달할 수 있다.
-
-> **[RPR-014]** 처리 lease 만료 복구: per-job lock의 `preemptedAt` 경과가 `JOB_LEASE_MS`(기본 `4 × JOB_PROCESSING_MS`)를 초과하면, **소유자가 `workers`에 등록되어 있어도** lease 만료로 간주해 [RPR-011]과 동일한 복구를 수행한다.
->
-> [LOCK-001]의 `preemptedAt`을 소비하는 유일한 규칙이다. 이것이 없으면 heartbeat는 정상이지만 consume만 hang한 Worker가 보유한 Job이 `pending` + 유효 lock 상태로 **영구 고착**된다([RPR-011]은 소유자가 registry에 있으면 판정 불가, [RPR-013]은 lock이 있으면 대상 아님). Worker 쪽에서는 [WRK-026]의 tick 상한이 같은 상황을 해소하며, 두 규칙이 만나는 지점에서 이중 커밋은 [WRK-024]의 소유권 재검증과 [WRK-012]의 self-fencing이 막는다.
+> **[RPR-013]** Lease 없는 `pending` 복구: `status === "pending"`인데 `leaseUntil`이 `null`인 Job(수동 편집·샘플 데이터([DATA-004])로 도달)은, `updatedAt`이 `REAPER_STALE_AFTER_MS`를 초과했다면 [RPR-011]과 동일한 CAS 절차로 `create`로 롤백한다.
 
 ---
 
@@ -433,32 +489,43 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 |---|---|---|
 | **[CON-001]** | 여러 Worker가 같은 Job 조회 | per-job lock exclusive create 성공자만 처리 |
 | **[CON-002]** | 특정 Job lock 실패 | 다음 `create` 후보 즉시 시도 |
-| **[CON-003]** | `jobs.json` 동시 변경 | global lock 직렬화 + 획득 후 reload + 원자적 rename 저장 |
+| **[CON-003]** | `jobs.json` 동시 변경 | 획득 후 reload + **버전 CAS 커밋**([LOCK-012]). global lock은 경합 완화용 |
 | **[CON-004]** | claim 전 상태 변경됨 | per-job lock 해제 후 다음 후보 |
-| **[CON-005]** | 완료 전 소유권 변경됨 | `done` 덮어쓰기 금지 |
+| **[CON-005]** | 완료 전 소유권 변경됨 | `owner`+`attemptId`+`leaseUntil` CAS 조건 불일치 → `done` 커밋 거부 |
 | **[CON-006]** | 처리 예외(프로세스 생존) | `pending → create` 롤백 |
 | **[CON-007]** | Worker 비정상 종료 | Reaper가 orphan lock 삭제 + 롤백 |
 | **[CON-008]** | API·Worker 동시 접근 | 모든 쓰기·일관 읽기는 global lock 경유 |
-| **[CON-009]** | lock 해제·회수 | 소유 검증 후 해제([LOCK-004]) 또는 rename 기반 회수([LOCK-010]) 필수. **plain unlink 금지** |
-| **[CON-010]** | Reaper가 생존 Worker를 오판 | Worker self-fencing([WRK-012])으로 커밋 차단 — 중복 실행은 허용, 이중 커밋은 불가 |
-| **[CON-011]** | 소유자 생존 + 처리 hang | [WRK-026] tick 상한 + [RPR-014] lease 만료 복구 |
+| **[CON-009]** | lock 탈취 발생 | 정확성에 영향 없음 — 빼앗긴 쪽의 커밋은 [LOCK-012] CAS / [LOCK-013] 토큰 검증에서 거부되고 재시도 |
+| **[CON-010]** | Reaper가 생존 Worker를 오판 | [WRK-012] self-fencing + CAS로 커밋 차단 — 중복 실행은 허용, 이중 커밋은 불가 |
+| **[CON-011]** | 소유자 생존 + 처리 hang | [WRK-026] tick 상한·협조적 취소 + [RPR-011] lease 만료 복구 |
+| **[CON-012]** | timeout된 옛 시도가 되살아남 | [LOCK-013] `attemptId` CAS 조건에서 거부 |
 
 ### 안전성의 근거
 
-이 설계의 안전성은 **두 층**으로 구성된다.
+**정확성은 잠금이 아니라 CAS에 있다.** 이것이 7차 검증(F16/F17)을 반영한 이 설계의 핵심 전환이다.
 
-1. **배타성은 파일시스템 원자성에서만 얻는다.** 획득은 `wx` exclusive create([LOCK-003]), 회수는 rename([LOCK-010] 2단계), 저장은 tmp + rename([LOCK-005]), 복원은 `fs.link`([LOCK-011]). "읽고 판단한 뒤 지운다"는 경로는 어디에도 없다 — 그 경로는 필연적으로 check-then-delete race를 만든다.
-2. **소유권은 커밋 시점에 재검증한다.** [WRK-024]의 상태·소유권 재확인, [WRK-012]의 self-fencing과 registry 재확인, [RPR-003]의 Reaper 자격 재확인. 따라서 회수 판정이 틀렸더라도 잘못된 커밋으로 이어지지 않는다.
+1. **모든 커밋은 버전 CAS다** ([LOCK-012]). `fs.link`는 목적지가 존재하면 원자적으로 `EEXIST` 실패하므로, 각 `version` 전이의 승자가 파일시스템 수준에서 정확히 한 명임이 보장된다. **global lock이 두 프로세스에게 동시 보유되더라도 lost update는 불가능하다.**
+2. **소유권은 레코드에 있고 커밋 시점에 검증된다** ([LOCK-013]). `owner` + `attemptId` + `leaseUntil`이 CAS 조건에 포함되므로, 정지 후 부활한 시도·lock을 빼앗긴 시도·timeout된 옛 시도의 커밋은 모두 구조적으로 거부된다.
+3. **잠금은 효율 장치로 격하되었다.** global lock과 per-job lock은 경합과 중복 실행을 줄이지만, 정확성의 근거가 아니다. 따라서 lock 탈취를 막기 위한 rename 왕복·복원 절차·조정용 mutex가 모두 불필요하다.
+
+> **pathname 잠금으로 정확성을 얻으려던 세 번의 시도와 그 실패**
+>
+> | 시도 | 실패 원인 |
+> |---|---|
+> | reap-mutex로 회수 직렬화 (2라운드) | mutex 자체의 `read → unlink → wx`에 동일한 race. 누출 시 복구 기능 영구 정지 |
+> | rename-to-sideline으로 배타 회수 (6차 반영) | A가 rename한 직후 **빈** canonical 경로에 새 lock이 생성되면, 뒤늦은 B의 rename이 그 **살아있는** lock을 이동 |
+> | 해제 시 선행 읽기로 TOCTOU 제거 (6차 반영) | 읽기와 rename 사이에 회수·재획득이 끼어들면 타인의 live lock을 이동 |
+>
+> 공통 원인: **읽어서 판정한 파일 identity와 나중에 조작하는 pathname을 원자적으로 결속하는 POSIX 연산이 없다.** 이 사실을 인정하고 정확성을 CAS로 옮긴 것이 현재 판이다.
 
 ### 알려진 한계 (README 기재 대상)
 
-파일 기반 잠금에는 fencing token이 없으므로, 다음 잔여 창이 남는다.
+- **중복 실행**: lock 탈취, Reaper 오판, lease 만료 시 같은 Job이 두 번 **실행**될 수 있다. 커밋은 한 번만 성공하므로 상태는 정확하지만, 실제 비즈니스 로직을 넣는다면 idempotency가 필요하다. [WRK-023]의 처리는 외부 부작용이 없어 무해하다.
+- **CAS 재시도 소진**: 극심한 경합에서 `CAS_MAX_RETRIES`를 초과하면 API는 `503`, Worker는 tick을 포기한다. 데이터는 안전하지만 처리량이 떨어진다.
+- **버전 디렉터리 증가**: `versions/`는 [RPR-015]가 정리하며, Reaper가 없는 배포(API 단독)에서는 누적된다.
+- **단일 파일시스템 전제**: 모든 프로세스가 같은 물리 파일시스템을 봐야 하고, `link`·`rename`의 원자성이 보장되어야 한다. 일부 네트워크 파일시스템에서는 성립하지 않는다.
 
-- **정지 후 부활**: lock 소유자가 stale timeout(global lock 5분, 등록용 lock 3분, per-job lock `WORKER_DELETE_AFTER_MS` 6분, 빈 lock 60초)을 넘겨 정지했다가 살아나는 GC pause·컨테이너 throttling. 이 경우 회수는 정당하지만 원 소유자가 자신이 소유자라고 오인할 수 있다. [WRK-012]/[WRK-024]의 재검증이 커밋을 막으므로 데이터 손상으로는 이어지지 않는다.
-- **[LOCK-010] 1~2단계 사이의 교체**: 판정 직후 rename 전에 원 소유자가 정상 해제하고 제3자가 새 lock을 게시하면, 3단계 재판정에서 불일치를 감지해 [LOCK-011]로 복원한다. 복원이 `EEXIST`로 실패하는 경우(그 짧은 사이에 또 다른 lock이 게시됨)에만 lock이 소실되며, 이때도 Job은 [RPR-013]으로 회수된다.
-- **중복 실행**: Reaper 오판이나 lease 만료 시 같은 Job이 두 번 실행될 수 있다. [WRK-023]의 처리는 외부 부작용이 없어 무해하지만, 실제 비즈니스 로직을 넣는다면 idempotency가 필요하다.
-
-강한 보장이 필요하면 PostgreSQL row lock(`SELECT ... FOR UPDATE SKIP LOCKED`)이나 Redis/RabbitMQ 기반 queue로 이전하는 것이 적절하다. 파일 잠금으로 fencing을 얻으려는 시도는 복잡도만 늘린다 — 이 명세의 reap-mutex 도입·철회가 그 사례다.
+강한 보장과 처리량이 필요하면 PostgreSQL(`SELECT ... FOR UPDATE SKIP LOCKED`)이나 Redis/RabbitMQ 기반 queue로 이전하는 것이 적절하다.
 
 ---
 
@@ -485,10 +552,14 @@ create ── Worker claim ──▶ pending ── 처리 완료 ──▶ done
 | `JOB_PROCESSING_MS` | 30,000 |
 | `CONSUME_TIMEOUT_MS` | 60,000 (`2 × JOB_PROCESSING_MS`) |
 | `JOB_LEASE_MS` | 120,000 (`4 × JOB_PROCESSING_MS`) |
+| `LEASE_RENEW_INTERVAL_MS` | 40,000 (`JOB_LEASE_MS / 3`) |
+| `CAS_MAX_RETRIES` | 10 |
+| `VERSION_KEEP_COUNT` | 5 |
 | `SHUTDOWN_DRAIN_MS` | 10,000 |
+| `BOOTSTRAP_LOCK_STALE_MS` | 600,000 (**고정 상수 — env로 재정의 불가**, [RUN-004] 3단계) |
 
-- 제약: `WORKER_DELETE_AFTER_MS > REAPER_STALE_AFTER_MS`, `JOB_LEASE_MS > CONSUME_TIMEOUT_MS > JOB_PROCESSING_MS`, `JOB_PROCESSING_MS < CONSUME_INTERVAL_MS`.
-- global lock 장기 장애 시 생존 Worker 보호는 Reaper 쪽 유예가 아니라 [WRK-012] self-fencing이 담당한다.
+- 제약: `WORKER_DELETE_AFTER_MS > REAPER_STALE_AFTER_MS`, `JOB_LEASE_MS > CONSUME_TIMEOUT_MS > JOB_PROCESSING_MS`, `JOB_PROCESSING_MS < CONSUME_INTERVAL_MS`, `LEASE_RENEW_INTERVAL_MS < JOB_LEASE_MS / 2`.
+- global lock 장기 장애 시 생존 Worker 보호는 Reaper 쪽 유예가 아니라 [WRK-012] self-fencing이 담당하며, 정확성은 [LOCK-012] CAS가 담당한다.
 
 > **[CFG-002]** (프로세스 간 합의가 필요한 설정) 아래 값들은 **한 프로세스가 다른 프로세스의 생존·소유권을 판정하는 기준**이므로, 같은 `STORAGE_DIR`을 공유하는 모든 프로세스에서 **동일해야 한다**.
 >
@@ -514,7 +585,8 @@ src/
 ├─ storage/       # json-db / global-lock / job-lock services
 └─ common/        # dto, errors, logging, time
 data/
-├─ jobs.json      # 샘플 데이터 포함, 커밋 대상
+├─ jobs.json      # 현재 상태(원자적 게시). 샘플 데이터 포함, 커밋 대상
+├─ versions/      # v{N}.json — [LOCK-012] CAS 토큰, 커밋 제외
 └─ locks/         # lock 파일 디렉터리, 커밋 제외
 ```
 
@@ -524,11 +596,14 @@ data/
 
 > **[RUN-004]** 부트스트랩 초기화: 프로세스 기동 시 순서대로 —
 >
-> 1. `STORAGE_DIR`·locks 디렉터리가 없으면 생성한다(멱등).
-> 2. `jobs.json`이 없으면 기본 스키마 `{ "jobs": [], "workers": {}, "reaper": { "workerId": null }, "config": null }`로 생성한다. 배타성과 내용 원자성을 함께 보장하기 위해, **임시 파일([LOCK-005] 명명 규칙)에 완전히 기록한 뒤 `fs.link(tmpPath, jobsJsonPath)`로 연결**하고 임시 파일을 삭제한다. `EEXIST`면 다른 프로세스가 이미 생성한 것이므로 임시 파일만 삭제하고 건너뛴다(동시 기동 race 방지 — 일반 write로 기존 데이터를 덮어쓰는 것과, `wx` 직접 쓰기 중 crash로 인한 부분 파일 잔존을 모두 방지).
-> 3. 최상위 키 누락 보정은 **global lock 임계 구역에서 reload 후** 수행한다([LOCK-005] 준수).
-> 4. **[CFG-002] fingerprint 검증**을 global lock 임계 구역에서 수행한다: `config.fingerprint`가 없으면(최초 기동) 자신의 값으로 기록하고, 있으면 자신의 값과 비교해 **불일치 시 FATAL 로깅 후 비-0 종료 코드로 중단**한다.
-> 5. `jobs.json`이 파싱 불가(손상)하면 **자동으로 초기화하지 않는다**(데이터 보호 우선). 기동 시 감지하면 FATAL 로깅 후 비-0 종료 코드로 중단하고, 런타임 reload 중 감지하면 해당 API 요청은 `500`, 해당 Worker tick은 중단 처리하며 오류를 로깅한다.
+> 1. `STORAGE_DIR`·`locks`·`versions` 디렉터리가 없으면 생성한다(멱등).
+> 2. **[CFG-002] fingerprint preflight** — 어떤 lock도 획득하기 **전에** `jobs.json`을 lock-free로 한 번 읽는다([LOCK-012] 4단계의 원자적 게시 덕분에 완전한 상태를 얻는다). `config.fingerprint`가 존재하고 자신의 값과 다르면 **즉시 FATAL 로깅 후 비-0 종료**한다. 이 단계는 lock 획득·회수·CAS 커밋보다 앞서야 한다.
+>
+>    검증을 lock 획득 **뒤로** 두면 순환이 생긴다: 잘못 설정된 프로세스(예: `GLOBAL_LOCK_STALE_AFTER_MS=1`)가 fingerprint 불일치를 발견하기 전에 자신의 잘못된 timeout으로 정상 프로세스의 live global lock을 stale로 판정해 회수해버린다. 즉 [CFG-002]가 막으려던 손상을 [CFG-002] 검증 과정이 유발한다.
+> 3. **부트스트랩 lock 획득에는 환경 변수로 재정의할 수 없는 보수적 상수를 사용한다**: stale 판정 임계값을 `BOOTSTRAP_LOCK_STALE_MS`(고정 600,000ms — 모든 기본 timeout보다 크다)로 두고, 부트스트랩 단계에서는 회수 자체를 생략할 수도 있다(다음 tick에 정상 경로가 회수한다).
+> 4. `jobs.json`이 없으면 기본 스키마 `{ "version": 0, "jobs": [], "workers": {}, "reaper": { "workerId": null }, "config": null }`로 생성한다. **임시 파일에 완전히 기록한 뒤 `fs.link(tmpPath, jobsJsonPath)`로 연결**하고 임시 파일을 삭제한다. `EEXIST`면 다른 프로세스가 이미 생성한 것이므로 임시 파일만 삭제하고 건너뛴다.
+> 5. 최상위 키 누락 보정과 `config.fingerprint` 최초 기록(2단계에서 `null`이었던 경우)은 [LOCK-005] 임계 구역에서 [LOCK-012] CAS로 수행한다. 이때도 `config.fingerprint`가 그사이 다른 값으로 기록되었으면 FATAL 종료한다(최초 기동 경쟁).
+> 6. `jobs.json`이 파싱 불가(손상)하면 **자동으로 초기화하지 않는다**(데이터 보호 우선). 기동 시 감지하면 FATAL 로깅 후 비-0 종료 코드로 중단하고, 런타임 reload 중 감지하면 해당 API 요청은 `500`, 해당 Worker tick은 중단 처리하며 오류를 로깅한다.
 
 > **[DOC-001]** `README.md`는 다음을 포함한다: ① 설치·실행·테스트 방법(API/Worker 별도 실행법, 다중 인스턴스 실행 예시 포함), ② 모든 엔드포인트의 요청/응답 예시, ③ 설계 코멘트(API 설계, 동시성 처리, 성능, 의도적 결정), ④ [부록 C](#부록-c-과제-해석-사항-readme-반영-대상)의 과제 해석 사항 전부, ⑤ §6의 안전성 근거와 알려진 한계, ⑥ 아래 **관측 타임라인과 빠른 확인 방법**.
 
@@ -564,10 +639,10 @@ data/
 |---|---|
 | API e2e | §3의 모든 엔드포인트 × 성공/실패 케이스 (상태 코드 + 응답 본문 형식). `?status=` 계열 정규화 순서([API-030]), 런타임 손상 시 `500` 본문 형식([API-004]) 포함 |
 | 로깅 | HTTP 요청 로깅[LOG-003], Worker·Reaper 처리 로깅[LOG-004] (scope별) |
-| Storage/Lock | [LOCK-003] 획득, [LOCK-003-a] 빈·부분 lock 회수(**생성 직후 crash fault injection**), [LOCK-004] 비소유자 해제가 타 lock을 건드리지 않음, [LOCK-005] reload-후-저장·원자적 저장, [LOCK-008]~[LOCK-011] 대기·503·회수·복원 |
+| Storage/Lock | [LOCK-003] 획득, [LOCK-003-a] 빈·부분 lock 회수(**생성 직후 crash fault injection**), [LOCK-004] 비소유자 해제가 타 lock을 건드리지 않음, [LOCK-005]·[LOCK-012] reload-후-CAS 커밋·`EEXIST` 재시도·원자적 게시, [LOCK-013] 토큰 검증, [LOCK-008]~[LOCK-010] 대기·503·회수 |
 | 초기화 | [RUN-004] 파일/디렉터리 부재·키 누락·손상·동시 기동, [CFG-002] fingerprint 불일치 시 FATAL |
 | Worker consume | [WRK-020]~[WRK-026] claim·완료·롤백·소유권 검증·tick 상한 |
-| Reaper | [RPR-001]~[RPR-014] 선출·grace period·각 복구 시나리오·lease 만료 |
+| Reaper | [RPR-001]~[RPR-015] 선출·grace period·lease 만료 복구·잔존 파일·버전 정리 |
 | Shutdown | [WRK-004] in-flight drain: heartbeat / reaper check / claim-직전 consume이 각각 shutdown 이후 상태를 재생성하지 않음(3가지 interleaving) |
 
 > **[TST-003]** 다음 동시성·복구 시나리오는 fake clock과 제어 가능한 lock으로 재현 가능하므로 **명시적 테스트 케이스로 고정**한다.
@@ -575,13 +650,17 @@ data/
 | # | 시나리오 | 기대 |
 |---|---|---|
 | 1 | 두 Worker가 같은 Job을 동시에 claim ([CON-001]) | 정확히 1개만 성공 |
-| 2 | 두 프로세스가 같은 stale lock을 동시에 회수 ([LOCK-010] 2단계) | rename 승자 1개, 패자는 `ENOENT`로 중단 후 획득 재시도 |
-| 3 | [LOCK-010] 1~2단계 사이에 lock이 교체됨 | 3단계 재판정 실패 → [LOCK-011] 복원, 살아있는 lock 보존 |
-| 4 | 비소유자가 [LOCK-004] 해제를 시도 | canonical 경로의 lock이 **전혀 변경되지 않음** |
+| 2 | **두 프로세스가 같은 `version`에서 동시에 커밋** ([LOCK-012]) | 한쪽만 `link` 성공, 패자는 `EEXIST` → reload 후 재시도, **최종 상태에 두 변경이 모두 반영** |
+| 3 | **global lock이 두 프로세스에게 동시 보유된 상태로 각각 저장** (탈취 재현) | lost update 없음 — CAS 패자가 재시도 |
+| 4 | 비소유자가 [LOCK-004] 해제를 시도 | `preemption` 불일치로 `unlink` 하지 않음 |
 | 5 | 경합 기아로 heartbeat 실패 → Reaper가 생존 Worker 삭제 | [WRK-012]에 의해 해당 Worker의 커밋이 거부됨 (`done` 미기록) |
 | 6 | `jobs-global-lock.json`이 존재하는 상태에서 Reaper cleanup 실행 | per-job lock으로 오인·회수되지 않음 ([LOCK-000]) |
-| 7 | 소유자 생존 + consume hang, `JOB_LEASE_MS` 초과 | [RPR-014]가 Job 회수, hang한 Worker는 커밋 실패 |
+| 7 | 소유자 생존 + consume hang, `JOB_LEASE_MS` 초과 | [RPR-011]이 Job 회수, hang한 Worker는 `attemptId`·`leaseUntil` 조건으로 커밋 실패 |
 | 8 | lock 생성 직후 metadata 기록 전 crash (빈 lock 잔존) | `PARTIAL_LOCK_STALE_MS` 경과 후 회수되어 global lock 교착이 풀림 |
+| 9 | **timeout된 시도 A가 되살아남 — 같은 Worker의 시도 B가 이미 재선점** ([CON-012]) | A의 완료·롤백·해제가 모두 거부됨. B의 선점과 lock이 온전히 유지 |
+| 10 | **claim 중 global lock 대기가 `JOB_LEASE_MS` 초과 → lock이 회수됨** | [WRK-021] 3단계의 lock `attemptId` 재검증에서 claim 포기, lock 없는 `pending` 전이 없음 |
+| 11 | **`GLOBAL_LOCK_STALE_AFTER_MS=1`로 잘못 설정된 프로세스 기동** | lock 획득·회수 **이전** preflight에서 fingerprint 불일치로 FATAL 종료. 정상 프로세스의 live lock 무영향 |
+| 12 | 처리 시간이 `JOB_LEASE_MS`를 초과 | [WRK-027] lease 갱신으로 회수되지 않음. 갱신 실패 시 처리 즉시 중단 |
 
 > **[TST-002]** 테스트는 실제 시간 대기 없이 실행 가능해야 한다(fake timer 또는 주입된 clock/interval 사용).
 
@@ -596,7 +675,7 @@ data/
 | 3 | `logs.txt` 로깅 | 없음 | §4 전체 신설 | 과제 필수 요구사항 누락 보정 |
 | 4 | 단건 응답 형식 | `list: [job]` 허용 또는 `job` 필드 | `job` 필드로 고정 | 설계 문서 §8.6이 권장한 방향으로 확정 |
 | 5 | 샘플 데이터 | 없음 | [DATA-004] 신설 | 과제 제출 요건 |
-| 6 | lock 생성 방식 | `fs.open(path, 'wx')` 후 내용 기록 | `fs.writeFile(path, content, { flag: 'wx' })` 단일 호출 | 빈 lock 파일 관측 창 제거(2단계 비원자성 결함) |
+| 6 | lock 생성 방식 | `fs.open(path, 'wx')` 후 내용 기록 | 동일(`open(wx)` → write → fsync → close) + [LOCK-003-a] 빈·부분 lock 회수 규칙 | `wx`는 경로의 배타적 **생성**만 보장하고 내용 기록까지 원자적이지 않다. 2라운드에서 `fs.writeFile(..., {flag:'wx'})`를 "단일 원자 호출"로 규정했던 것은 **오류이며 철회**했다(부록 A-2 F11) |
 | 7 | lock 해제 | 파일 삭제 | 삭제 전 소유 검증([LOCK-004]) | 타 주체가 복구·재획득한 lock 오삭제 방지 |
 | 8 | stale global lock 복구 주체 | Reaper 전유 | 모든 프로세스([LOCK-009]) | Reaper 선출 자체가 global lock을 요구하므로 Reaper 전유 시 데드락. API 단독 배포에서도 복구 불가 문제 해소 |
 | 9 | stale lock 삭제 방식 | 재확인 후 삭제 | 원자적 rename 경유([LOCK-010]) | check-then-delete race로 인한 살아있는 lock 오삭제 방지 |
@@ -614,7 +693,7 @@ data/
 | 21 | 저장 임시 파일 | 미규정 | Process ID+난수 포함 파일명([LOCK-005]) | 프로세스 간 임시 파일 충돌로 인한 부분 쓰기 rename 방지 |
 | 22 | `node-json-db` 저장 경로 | 자체 save | 파싱·조작에만 사용, persist는 원자적 rename으로 자체 수행 | 기술 스택 요건과 crash-safety 양립 |
 | 23 | `:id` 검증 범위 | GET만 언급 | `:id` 라우트 전체([API-040]) | PATCH의 형식 오류 응답 결정성 |
-| 24 | lock 복원 방식 | 없음 | no-replace 복원(`fs.link`, [LOCK-011]) | `fs.rename`은 목적지 존재 시 조용히 덮어쓰므로 살아있는 lock 파괴 가능 — 도달 불가능한 `EEXIST` 가드 대체 |
+| 24 | 커밋 방식 | `node-json-db` save | tmp 기록 → `fs.link`로 버전 CAS → 원자적 게시([LOCK-012]) | 저장 중 crash로 인한 손상과 lock 탈취로 인한 lost update를 함께 차단. (6차 반영판의 `fs.link` 복원 절차 [LOCK-011]은 부록 A-2에서 철회) |
 
 ### 부록 A-1. 외부 적대적 검증(5·6차) 반영 — reap-mutex 철회와 self-fencing 전환
 
@@ -639,6 +718,22 @@ PR #1의 외부 검증에서 critical 3 / high 6 / medium 5 / low 1 = 15건이 �
 | F10 `JOB_PROCESSING_MS == CONSUME_INTERVAL_MS` | low | 기본값 30,000ms로 하향, [DOC-002] 신설(타임라인 + 빠른 확인 env) |
 
 `REAP_MUTEX_STALE_MS`와 `reaper.lastGlobalLockReapAt`은 제거되었고, `PARTIAL_LOCK_STALE_MS`·`CONSUME_TIMEOUT_MS`·`JOB_LEASE_MS`·`SHUTDOWN_DRAIN_MS`·`config.fingerprint`가 추가되었다.
+
+### 부록 A-2. 외부 적대적 검증(7차) 반영 — 정확성을 잠금에서 CAS로 이전
+
+7차 검증에서 critical 2 / high 4 / low 1 = 7건이 보고되었다. 두 critical(F16·F17)의 공통 원인은 **읽어서 판정한 파일 identity와 나중에 조작하는 pathname을 원자적으로 결속할 수 없다**는 것으로, 6차 반영판의 rename-to-sideline 회수와 선행 읽기 해제가 모두 이 반례에 걸렸다(재현 결과 첨부됨). 개별 보강으로는 닫히지 않는 문제이므로, **정확성의 근거를 잠금의 배타성에서 버전 CAS로 이전**했다.
+
+| 발견 | 심각도 | 조치 |
+|---|---|---|
+| F16 rename이 새 소유자의 live lock을 탈취 | critical | **[LOCK-012]** 버전 CAS 커밋 신설 — `fs.link`로 `versions/v{N+1}.json` 생성, `EEXIST`면 재시도. lock 이중 보유에도 lost update 불가. [LOCK-010]은 단순 `unlink`로 축소하고 탈취 가능성을 명시적으로 인정 |
+| F17 선행 읽기가 해제 TOCTOU를 막지 못함 | critical | [LOCK-004]를 "검증 후 `unlink`"로 단순화하고, 잔여 창이 무해한 이유를 [LOCK-012]로 근거화. **[LOCK-013]** 선점 토큰(`owner`·`attemptId`·`leaseUntil`)을 레코드에 도입 |
+| F18 timeout 후 옛 callback이 다음 시도의 lock을 오인 | high | [LOCK-013] `attemptId`를 시도마다 생성하고 [WRK-024]/[WRK-025]/[WRK-027]의 CAS 조건에 포함. [WRK-026]에 협조적 취소(`AbortSignal`) + generation guard 명시 |
+| F19 lease 회수 후 lock 없는 claim 경로 | high | [WRK-021] 3단계에 **canonical lock의 `attemptId` 재검증** 추가 |
+| F20 [LOCK-010] 판정 조건에 per-job 회수 조건 누락 | high | [LOCK-009]에 대상별 회수 조건 표를 명시(global / per-job / 공통) |
+| F21 fingerprint 검증이 lock 획득 뒤라 순환 | high | [RUN-004] 재작성 — **2단계 lock-free preflight**로 검증을 앞당기고, 3단계 부트스트랩 lock에 env로 못 바꾸는 `BOOTSTRAP_LOCK_STALE_MS` 고정 상수 사용. 최초 생성 경쟁 경로도 정의 |
+| F22 [LOCK-003] 변경과 잔존 문구 충돌 | low | [WRK-021] 1~2단계 문구, 부록 A #6, [DATA-001] 최상위 키 설명을 함께 갱신 |
+
+구조 변경 요약: `version`·`owner`·`attemptId`·`leaseUntil` 필드와 `versions/` 디렉터리가 추가되었고, [LOCK-011](복원 절차)·[RPR-014](별도 lease 규칙)·`*.stale-*`/`*.release-*` 잔존 파일 규칙은 **불필요해져 삭제**되었다. [RPR-011]은 lease 기반으로 통합되었고 [RPR-015](잔존 파일·버전 정리)가 신설되었다.
 
 ## 부록 B. 초기설계 대비 확정 사항
 
