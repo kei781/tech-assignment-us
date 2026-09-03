@@ -4,7 +4,11 @@
  */
 import { JobLockMetadata, JobsFile } from './types';
 
-/** [TST-002] 주입 가능한 시계 */
+/**
+ * [TST-002] 주입 가능한 시계.
+ * 구현은 모든 시간 판정(타임스탬프 비교는 물론, 파일 mtime 나이 계산 포함)에
+ * 반드시 이 Clock을 기준으로 사용해야 한다.
+ */
 export interface Clock {
   now(): Date;
 }
@@ -13,7 +17,11 @@ export interface Clock {
 export type LogScope = 'http' | 'worker' | 'reaper' | 'storage';
 export type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'FATAL';
 
-/** [LOG-001] ~ [LOG-005] */
+/**
+ * [LOG-001] ~ [LOG-005]
+ * 구현은 호출마다 단일 append 연산으로 기록하며, 파일 핸들을 유지하지 않는다
+ * (프로세스 간 append 안전성 + 테스트 정리 시 열린 핸들 제거).
+ */
 export interface AppLogger {
   log(level: LogLevel, scope: LogScope, message: string): void;
 }

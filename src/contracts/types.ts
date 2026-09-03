@@ -31,9 +31,9 @@ export interface JobsFile {
   reaper: ReaperState;
 }
 
-/** {jobId}-lock.json 내용. [LOCK-001] */
+/** {jobId}-lock.json 내용. [LOCK-001] (global lock에서는 preemption이 process id) */
 export interface JobLockMetadata {
-  preemption: string; // 64-hex worker id
+  preemption: string; // 64-hex id — per-job lock: worker id, global lock: process id(API 포함)
   preemptedAt: string; // ISO 8601 UTC
 }
 

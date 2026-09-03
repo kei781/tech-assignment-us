@@ -13,6 +13,8 @@ import {
 } from '../../src/contracts/types';
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** [API-011] 서버 생성 id는 UUID v4 (version=4, variant=8/9/a/b) */
+export const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 /** 테스트 전용 임시 storage 디렉터리 생성 */
@@ -21,7 +23,8 @@ export async function mkStorageDir(): Promise<string> {
 }
 
 export async function rmDir(dir: string): Promise<void> {
-  await fs.rm(dir, { recursive: true, force: true });
+  // Windows: 직전 테스트의 파일 핸들이 닫히는 중일 수 있어 재시도
+  await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 /**
@@ -39,9 +42,14 @@ export function testConfig(storageDir: string, overrides: Partial<AppConfig> = {
   };
 }
 
-/** [TST-002] 수동 제어 시계 */
+/**
+ * [TST-002] 수동 제어 시계.
+ * 기본 시작 시각은 "실제 현재 시각"이다 — 파일 mtime(실제 시간축)과
+ * 주입 시계(판정 기준)의 축을 일치시켜, 벽시계에 따라 결과가 갈리는
+ * 단언을 방지한다. advance() 전까지는 고정되어 결정적이다.
+ */
 export class ManualClock implements Clock {
-  constructor(private t: Date = new Date('2026-09-03T20:00:00.000Z')) {}
+  constructor(private t: Date = new Date()) {}
   now(): Date {
     return new Date(this.t.getTime());
   }

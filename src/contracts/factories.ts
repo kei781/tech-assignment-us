@@ -35,6 +35,14 @@ export interface WorkerFactoryOptions {
    */
   processJob?: (jobId: string) => Promise<void>;
   logger?: AppLogger;
+  /**
+   * 테스트 전용 seam (기본 no-op).
+   * afterJobLockAcquired: per-job lock 획득 직후, claim 재검증 트랜잭션
+   * ([WRK-021] 2단계) 직전에 호출된다 — 재검증 분기의 결정적 테스트용.
+   */
+  hooks?: {
+    afterJobLockAcquired?: (jobId: string) => Promise<void>;
+  };
 }
 
 export interface LoggerFactoryOptions {

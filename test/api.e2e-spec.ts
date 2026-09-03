@@ -5,10 +5,12 @@ import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { createApiApp } from '../src/contracts/factories';
 import { AppConfig } from '../src/contracts/config';
+import { promises as fs } from 'fs';
 import {
   fileExists,
   hex64,
   jobLockPath,
+  jobsJsonPath,
   LOG_LINE_RE,
   makeJob,
   ManualClock,
@@ -18,7 +20,7 @@ import {
   rmDir,
   seedJobs,
   testConfig,
-  UUID_RE,
+  UUID_V4_RE,
   ISO_UTC_RE,
   writeGlobalLock,
   writeJobLock,
@@ -71,7 +73,7 @@ describe('Queue API (e2e)', () => {
       expect(res.body.status).toBe(201);
       expect(res.body.result).toBe('success');
       const job = res.body.job;
-      expect(job.id).toMatch(UUID_RE);
+      expect(job.id).toMatch(UUID_V4_RE);
       expect(job.title).toBe('my title');
       expect(job.description).toBe('my description');
       expect(job.status).toBe('create');
