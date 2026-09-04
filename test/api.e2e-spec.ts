@@ -1,6 +1,3 @@
-/**
- * REST API e2e 테스트. SPEC §4, [LOG-003], [RUN-004]
- */
 import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { AppConfig } from '../src/common/config';
@@ -149,7 +146,7 @@ describe('Jobs API (e2e)', () => {
 
   describe('[API-030][API-031][API-032] GET /jobs/search', () => {
     beforeEach(async () => {
-      // 기동 복구([CON-006])가 pending을 create로 되돌리므로 fixture는 create/done만 둔다.
+      // 기동 복구가 pending을 create로 되돌리므로 fixture는 create/done만 둔다.
       // pending 검색은 기동 후 선점으로 만든다.
       await seedJobs(dir, [
         makeJob({
@@ -362,7 +359,6 @@ describe('Jobs API (e2e)', () => {
       await seedJobs(dir, [job]);
       await boot();
 
-      // 스케줄러 선점으로 pending을 만든다([SCH-003]).
       const claimed = await service.claimNext();
       expect(claimed?.status).toBe('pending');
 

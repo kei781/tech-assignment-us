@@ -1,8 +1,6 @@
 /**
- * 테스트용 애플리케이션 조립. [TST-002]
- *
  * 프로덕션과 같은 AppModule을 쓰고 설정·시계·처리 로직만 교체한다.
- * 부트스트랩 경로를 테스트가 따로 재현하지 않으므로, 실제 실행과 어긋날 여지가 없다.
+ * 부트스트랩 경로를 테스트가 따로 재현하지 않으므로 실제 실행과 어긋날 여지가 없다.
  */
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
@@ -25,7 +23,6 @@ export interface TestApp {
 export interface CreateTestAppOptions {
   config: AppConfig;
   clock?: Clock;
-  /** [SCH-004] 처리 로직 교체 — 지연·예외·수동 제어를 테스트가 결정한다. */
   task?: JobTask;
   /** true면 app.init()을 호출하지 않는다 (기동 실패를 검증할 때 사용) */
   skipInit?: boolean;

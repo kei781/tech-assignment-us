@@ -1,6 +1,3 @@
-/**
- * 저장소 테스트. SPEC §3 [CON-002] ~ [CON-004], [CON-006], [RUN-004]
- */
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { AppConfig } from '../src/common/config';
@@ -70,7 +67,6 @@ describe('JobsStore', () => {
 
       await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
 
-      // 데이터 보호: 원본을 덮어쓰지 않았다
       const raw = await fs.readFile(jobsJsonPath(dir), 'utf8');
       expect(raw).toContain('this is not json');
     });
@@ -107,7 +103,6 @@ describe('JobsStore', () => {
       expect(byId.get(pendingA.id)?.status).toBe('create');
       expect(byId.get(pendingB.id)?.status).toBe('create');
       expect(byId.get(pendingA.id)?.updatedAt).toBe(clock.iso());
-      // 다른 상태는 건드리지 않는다
       expect(byId.get(done.id)?.status).toBe('done');
       expect(byId.get(create.id)?.updatedAt).toBe(create.updatedAt);
     });
@@ -207,10 +202,9 @@ describe('JobsStore', () => {
         }),
       ).rejects.toThrow('디스크 오류');
 
-      // 인메모리: 교체는 저장 성공 후에만 일어난다([CON-002] 4단계)
+      // 교체는 저장 성공 후에만 일어난다
       expect(store.snapshot().jobs).toHaveLength(1);
       expect(store.snapshot().jobs[0].title).toBe('first');
-      // 디스크: 그대로
       expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(diskBefore);
     });
   });
@@ -248,7 +242,7 @@ describe('JobsStore', () => {
 
     /**
      * rename만이 실패 지점이 아니다. write/fsync/close 실패도 임시 파일을 남기면
-     * 반복되는 디스크 오류가 숨겨진 .tmp를 계속 누적시켜 [CON-003]을 깬다.
+     * 반복되는 디스크 오류가 숨겨진 .tmp를 계속 누적시킨다.
      */
     it.each(['writeFile', 'sync'] as const)(
       'FileHandle.%s가 실패해도 임시 파일을 남기지 않는다',
@@ -275,7 +269,6 @@ describe('JobsStore', () => {
 
         const files = await listDir(dir);
         expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
-        // canonical 파일은 손상되지 않는다
         expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(diskBefore);
         expect(store.snapshot().jobs).toHaveLength(0);
       },

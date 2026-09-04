@@ -1,6 +1,4 @@
 /**
- * 커밋된 샘플 데이터 검증. SPEC [DATA-004], [DATA-001] ~ [DATA-003], [TST-004]
- *
  * `data/jobs.json`은 과제 제출 요건("조회 동작 확인용 샘플 데이터")이면서
  * **앱이 실행 중에 덮어쓰는 파일**이다. 기본 설정으로 한 번 띄우기만 해도
  * 모든 Job이 done으로 바뀌므로, 시연 후 무심코 커밋하면 3상태를 보여준다는
@@ -66,14 +64,12 @@ describe('[DATA-004] 커밋된 샘플 데이터 (data/jobs.json)', () => {
 
       expect(JOB_STATUSES).toContain(job.status as JobStatus);
 
-      // [DATA-003] ISO 8601 UTC
       expect(job.createdAt).toMatch(ISO_UTC_RE);
       expect(job.updatedAt).toMatch(ISO_UTC_RE);
       expect(new Date(job.updatedAt).getTime()).toBeGreaterThanOrEqual(
         new Date(job.createdAt).getTime(),
       );
 
-      // 정의되지 않은 필드가 섞여 있지 않다
       expect(Object.keys(job).sort()).toEqual([
         'createdAt',
         'description',

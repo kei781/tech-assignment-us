@@ -1,6 +1,4 @@
 /**
- * 동시성 시나리오. SPEC [TST-003]
- *
  * 과제 요구사항 5번("API 요청과 스케줄러가 동시에 같은 데이터에 접근하는 환경에서
  * 데이터가 손실되거나 깨지지 않게 하라")에 대한 답을 8개 케이스로 고정한다.
  */
@@ -102,7 +100,7 @@ describe('[TST-003] 동시성 시나리오', () => {
 
   describe('3. 수정과 선점을 동시에 시작 → 수정이 소실된 채 pending이 되는 결과는 없다', () => {
     /**
-     * [CON-002] mutex는 호출 순서대로 실행을 직렬화한다(promise chain에 동기 등록).
+     * mutex는 호출 순서대로 실행을 직렬화한다(promise chain에 동기 등록).
      * 따라서 두 순서를 각각 결정적으로 재현할 수 있다 — 확률에 기대지 않는다.
      */
     it('(a) 수정이 먼저 큐에 들어가면: 수정 성공 후 선점 — 수정 내용이 남는다', async () => {
@@ -120,7 +118,6 @@ describe('[TST-003] 동시성 시나리오', () => {
       expect(claimed?.id).toBe(job.id);
 
       const stored = (await readJobsFile(dir)).jobs[0];
-      // 선점이 뒤따랐지만 수정 내용은 소실되지 않았다.
       expect(stored.status).toBe('pending');
       expect(stored.title).toBe('updated');
     });
@@ -200,7 +197,6 @@ describe('[TST-003] 동시성 시나리오', () => {
     const tick = processor.tickOnce();
     await waitFor(() => task.started.length === 1);
 
-    // 처리가 진행되는 동안 요청을 보낸다.
     const created = await http()
       .post('/jobs')
       .send({ title: 'during processing', description: 'd' })

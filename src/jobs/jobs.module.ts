@@ -10,7 +10,6 @@ import { JobsStore } from './jobs.store';
     JobsStore,
     JobsService,
     JobsProcessor,
-    // [SCH-004] 실제 처리 로직은 주입 가능하다 — 테스트가 교체한다([TST-002]).
     { provide: JOB_TASK, useClass: DelayJobTask },
   ],
   exports: [JobsService, JobsStore, JobsProcessor],
