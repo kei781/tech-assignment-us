@@ -182,18 +182,20 @@ export class JobsStore implements OnModuleInit {
   private async writeAtomic(filePath: string, serialized: string): Promise<void> {
     const tmpPath = `${filePath}.${randomBytes(6).toString('hex')}.tmp`;
 
-    const handle = await fs.open(tmpPath, 'wx');
     try {
-      await handle.writeFile(serialized, 'utf8');
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
+      const handle = await fs.open(tmpPath, 'wx');
+      try {
+        await handle.writeFile(serialized, 'utf8');
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
 
-    try {
       await fs.rename(tmpPath, filePath);
     } catch (error) {
-      // 임시 파일을 남기지 않는다.
+      // open 이후의 모든 실패 지점(write·fsync·close·rename)에서 임시 파일을 정리한다.
+      // rename만 정리하면 반복되는 디스크 오류가 숨겨진 .tmp를 계속 누적시킨다.
+      // open 자체가 실패했다면 tmpPath가 없으므로 force:true가 ENOENT를 무시한다.
       await fs.rm(tmpPath, { force: true }).catch(() => undefined);
       throw error;
     }

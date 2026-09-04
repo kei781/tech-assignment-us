@@ -5,6 +5,8 @@
  * tick은 tickOnce()로 직접 호출하고, 처리 로직은 ControllableTask로 교체한다.
  */
 import { INestApplication } from '@nestjs/common';
+import { promises as fsPromises } from 'node:fs';
+import request from 'supertest';
 import { AppConfig } from '../src/common/config';
 import { AppLogger } from '../src/common/logging/app-logger';
 import { JobsProcessor } from '../src/jobs/jobs.processor';
@@ -232,6 +234,89 @@ describe('JobsProcessor', () => {
     });
   });
 
+  describe('[SCH-005] 선점 단계 실패도 오류 경계 안에 있다', () => {
+    /**
+     * 자동 호출부는 `void this.tickOnce()`이므로 catch handler가 없다.
+     * tick이 reject하면 처리되지 않은 rejection이 되어 Node 기본 동작에서
+     * 프로세스가 죽는다 — 일시적 저장 실패 하나가 스케줄러 전체를 멈춘다.
+     */
+    it('claimNext가 실패해도 tickOnce는 reject하지 않고 로깅한다', async () => {
+      await seedJobs(dir, [makeJob({ status: 'create' })]);
+      await boot();
+
+      jest.spyOn(service, 'claimNext').mockRejectedValueOnce(new Error('저장 실패'));
+
+      await expect(processor.tickOnce()).resolves.toBeUndefined();
+
+      await logger.flush();
+      const lines = (await readLogLines(config.logFilePath)).filter((l) => l.includes('[scheduler]'));
+      expect(lines.some((l) => l.includes('ERROR') || l.includes('저장 실패'))).toBe(true);
+    });
+
+    it('선점 실패 후에도 guard가 해제되어 다음 tick이 정상 동작한다', async () => {
+      const job = makeJob({ status: 'create' });
+      await seedJobs(dir, [job]);
+      await boot();
+
+      jest.spyOn(service, 'claimNext').mockRejectedValueOnce(new Error('일시적 저장 실패'));
+      await processor.tickOnce();
+
+      jest.restoreAllMocks();
+      await processor.tickOnce();
+
+      expect(statusOf(job.id)).toBe('done');
+    });
+
+    it('markDone이 실패해도 tickOnce는 reject하지 않는다', async () => {
+      await seedJobs(dir, [makeJob({ status: 'create' })]);
+      await boot();
+
+      jest.spyOn(service, 'markDone').mockRejectedValueOnce(new Error('완료 저장 실패'));
+
+      await expect(processor.tickOnce()).resolves.toBeUndefined();
+    });
+
+    /**
+     * F1의 실제 증상은 "tick이 reject한다"가 아니라 "처리되지 않은 rejection이 되어
+     * 프로세스가 죽는다"이므로, 그 신호를 직접 관측한다.
+     */
+    it('기동 즉시 tick의 저장 실패가 처리되지 않은 rejection을 만들지 않는다', async () => {
+      await seedJobs(dir, [makeJob({ status: 'create' })]);
+
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown): void => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandled);
+
+      try {
+        // 즉시 tick([SCH-001])이 도는 구성에서 선점 커밋이 실패하도록 저장을 막는다.
+        const renameSpy = jest
+          .spyOn(fsPromises, 'rename')
+          .mockRejectedValue(new Error('디스크 오류'));
+
+        await boot({ schedulerEnabled: true, consumeIntervalMs: 600_000 });
+
+        // 즉시 tick이 완료될 시간을 준다 (실패 로그가 남는 것으로 확인).
+        await logger.flush();
+        await waitFor(async () => {
+          await logger.flush();
+          const lines = await readLogLines(config.logFilePath);
+          return lines.some((l) => l.includes('선점 실패') || l.includes('tick 실패'));
+        });
+
+        renameSpy.mockRestore();
+
+        // 프로세스가 살아 있고 다음 tick도 정상 동작한다.
+        await expect(processor.tickOnce()).resolves.toBeUndefined();
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+
+      expect(unhandled).toEqual([]);
+    });
+  });
+
   describe('[CON-007] 정상 종료', () => {
     it('진행 중인 tick이 끝날 때까지 기다린 뒤 종료한다', async () => {
       const job = makeJob({ status: 'create' });
@@ -283,6 +368,34 @@ describe('JobsProcessor', () => {
       await processor.tickOnce();
 
       expect(task.started).toHaveLength(0);
+    });
+
+    /**
+     * FileLogger.log()는 append를 비동기로 예약하고 즉시 반환한다.
+     * Nest의 signal handler는 shutdown hook 직후 프로세스를 재종료하므로,
+     * flush하지 않으면 종료 로그와 직전에 대기 중이던 로그가 함께 유실된다.
+     */
+    it('종료 시 대기 중인 로그를 flush한다 (테스트가 flush를 호출하지 않아도 기록된다)', async () => {
+      await seedJobs(dir, [makeJob({ status: 'create' })]);
+      await boot();
+
+      await processor.tickOnce();
+      await processor.stop();
+
+      // 의도적으로 logger.flush()를 호출하지 않는다.
+      const lines = await readLogLines(config.logFilePath);
+      expect(lines.some((l) => l.includes('[scheduler]') && l.includes('선점'))).toBe(true);
+      expect(lines.some((l) => l.includes('[scheduler]') && l.includes('종료'))).toBe(true);
+    });
+
+    it('app.close()가 대기 중인 HTTP 로그까지 flush한다', async () => {
+      await boot();
+
+      await request(app.getHttpServer()).get('/jobs').expect(200);
+      await app.close();
+
+      const lines = await readLogLines(config.logFilePath);
+      expect(lines.some((l) => l.includes('[http]') && l.includes('GET /jobs 200'))).toBe(true);
     });
 
     it('app.close()가 진행 중인 tick을 drain한다 (shutdown hook 경로)', async () => {

@@ -38,12 +38,22 @@ export const DEFAULT_CONFIG: AppConfig = {
 /** DI 토큰 */
 export const APP_CONFIG = Symbol('APP_CONFIG');
 
-function intFromEnv(name: string, fallback: number): number {
+/**
+ * Node timer가 처리할 수 있는 최대 delay (32-bit signed).
+ * 이 값을 넘기면 libuv가 delay를 1ms로 보정해버린다.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function intFromEnv(name: string, fallback: number, min = 0, max = MAX_TIMER_DELAY_MS): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
+
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(`${name}은(는) 0 이상의 정수여야 합니다: "${raw}"`);
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`${name}은(는) 정수여야 합니다: "${raw}"`);
+  }
+  if (parsed < min || parsed > max) {
+    throw new Error(`${name}은(는) ${min}..${max} 범위여야 합니다: "${raw}"`);
   }
   return parsed;
 }
@@ -66,9 +76,12 @@ export function loadConfig(): AppConfig {
   return {
     jobsFilePath: strFromEnv('JOBS_FILE_PATH', DEFAULT_CONFIG.jobsFilePath),
     logFilePath: strFromEnv('LOG_FILE_PATH', DEFAULT_CONFIG.logFilePath),
-    consumeIntervalMs: intFromEnv('CONSUME_INTERVAL_MS', DEFAULT_CONFIG.consumeIntervalMs),
-    jobProcessingMs: intFromEnv('JOB_PROCESSING_MS', DEFAULT_CONFIG.jobProcessingMs),
-    shutdownDrainMs: intFromEnv('SHUTDOWN_DRAIN_MS', DEFAULT_CONFIG.shutdownDrainMs),
+    // interval은 0을 허용하지 않는다. setInterval(fn, 0)은 1ms로 보정되어
+    // 빈 큐에서도 매 tick 로그를 append하며 CPU/I-O를 태우고 logs.txt를 채운다.
+    consumeIntervalMs: intFromEnv('CONSUME_INTERVAL_MS', DEFAULT_CONFIG.consumeIntervalMs, 1),
+    // 처리 시간과 drain에는 0("대기 없음")이 의미가 있으므로 허용한다.
+    jobProcessingMs: intFromEnv('JOB_PROCESSING_MS', DEFAULT_CONFIG.jobProcessingMs, 0),
+    shutdownDrainMs: intFromEnv('SHUTDOWN_DRAIN_MS', DEFAULT_CONFIG.shutdownDrainMs, 0),
     schedulerEnabled: boolFromEnv('SCHEDULER_ENABLED', DEFAULT_CONFIG.schedulerEnabled),
   };
 }

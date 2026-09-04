@@ -15,7 +15,7 @@ NestJS로 작업(Job)을 관리하는 백엔드입니다. REST API로 작업을 
 npm install
 ```
 
-Node 20 이상을 권장합니다(개발·검증은 Node 24에서 진행). 추가 설정 없이 바로 실행됩니다.
+**Node 20 이상이 필요합니다** — `@nestjs/core@11`의 `engines.node`가 `>= 20`이며 `package.json`에도 선언해 두었습니다(개발·검증은 Node 24에서 진행). 추가 설정 없이 바로 실행됩니다.
 
 ### 실행
 
@@ -51,7 +51,7 @@ $env:JOB_PROCESSING_MS=500; $env:CONSUME_INTERVAL_MS=2000; npm run start
 npm test
 ```
 
-105개 테스트 / 5개 스위트입니다. 실제 스케줄러 주기나 처리 시간을 기다리지 않습니다([TST-002]) — 시계와 처리 로직을 주입하고 tick을 직접 호출합니다.
+129개 테스트 / 6개 스위트입니다. 실제 스케줄러 주기나 처리 시간을 기다리지 않습니다([TST-002]) — 시계와 처리 로직을 주입하고 tick을 직접 호출합니다.
 
 | 스위트 | 검증 대상 |
 |---|---|
@@ -60,6 +60,7 @@ npm test
 | `test/scheduler.spec.ts` | 선점·완료·롤백·재진입 guard·종료 drain |
 | `test/concurrency.spec.ts` | **동시성 시나리오 8종** ([TST-003]) |
 | `test/logging.spec.ts` | 로그 형식·append·best-effort |
+| `test/config.spec.ts` | 환경 변수 로드·범위 검증·실행 전제 |
 
 ### 설정값
 
@@ -74,6 +75,8 @@ npm test
 | `SCHEDULER_ENABLED` | `true` | `false`면 스케줄러를 띄우지 않고 API만 실행 |
 
 `JOB_PROCESSING_MS`가 `CONSUME_INTERVAL_MS`보다 크거나 같으면 매 tick 재진입 guard가 발동해 실효 처리량이 떨어집니다. 기동은 막지 않고 경고를 남깁니다.
+
+ms 값은 정수여야 하고 `2,147,483,647`(Node timer의 32-bit 한계)을 넘을 수 없습니다. `CONSUME_INTERVAL_MS`는 **1 이상**이어야 합니다 — `0`이나 범위를 넘는 값은 libuv가 1ms로 보정해 빈 큐에서도 매 tick 로그를 남기며 CPU와 `logs.txt`를 태웁니다. 오설정을 런타임 폭주로 바꾸지 않고 기동 시점에 거부합니다. `JOB_PROCESSING_MS`·`SHUTDOWN_DRAIN_MS`는 "대기 없음"이라는 의미가 있어 `0`을 허용합니다.
 
 ### 샘플 데이터
 

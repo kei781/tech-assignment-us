@@ -246,6 +246,72 @@ describe('JobsStore', () => {
       expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
     });
 
+    /**
+     * rename만이 실패 지점이 아니다. write/fsync/close 실패도 임시 파일을 남기면
+     * 반복되는 디스크 오류가 숨겨진 .tmp를 계속 누적시켜 [CON-003]을 깬다.
+     */
+    it.each(['writeFile', 'sync'] as const)(
+      'FileHandle.%s가 실패해도 임시 파일을 남기지 않는다',
+      async (method) => {
+        const store = newStore();
+        await store.init();
+        const diskBefore = await fs.readFile(jobsJsonPath(dir), 'utf8');
+
+        const probe = await fs.open(path.join(dir, 'probe-' + method), 'w');
+        const handleProto = Object.getPrototypeOf(probe);
+        await probe.close();
+
+        const spy = jest
+          .spyOn(handleProto, method)
+          .mockRejectedValueOnce(new Error(method + ' 실패'));
+
+        await expect(
+          store.mutate((draft) => {
+            draft.jobs.push(makeJob());
+          }),
+        ).rejects.toThrow(method + ' 실패');
+
+        spy.mockRestore();
+
+        const files = await listDir(dir);
+        expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
+        // canonical 파일은 손상되지 않는다
+        expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(diskBefore);
+        expect(store.snapshot().jobs).toHaveLength(0);
+      },
+    );
+
+    it('close가 실패해도 임시 파일을 남기지 않는다', async () => {
+      const store = newStore();
+      await store.init();
+      const diskBefore = await fs.readFile(jobsJsonPath(dir), 'utf8');
+
+      // close는 프로토타입이 아니라 FileHandle 인스턴스의 own property이므로
+      // open을 감싸서 주입한다. fd는 실제로 닫은 뒤 오류를 던진다 — close가
+      // 오류를 보고하지만 디스크립터는 해제된 현실적인 상황이다.
+      const realOpen = fs.open;
+      jest.spyOn(fs, 'open').mockImplementationOnce(async (...args) => {
+        const handle = await (realOpen as typeof fs.open)(...args);
+        const realClose = handle.close.bind(handle);
+        handle.close = async (): Promise<void> => {
+          await realClose();
+          throw new Error('close 실패');
+        };
+        return handle;
+      });
+
+      await expect(
+        store.mutate((draft) => {
+          draft.jobs.push(makeJob());
+        }),
+      ).rejects.toThrow('close 실패');
+
+      const files = await listDir(dir);
+      expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
+      expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(diskBefore);
+      expect(store.snapshot().jobs).toHaveLength(0);
+    });
+
     it('디스크에 쓰기 전에 fsync한다', async () => {
       const store = newStore();
       await store.init();

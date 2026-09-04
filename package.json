@@ -2,6 +2,9 @@
   "name": "jobs-backend",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "description": "NestJS Jobs backend — REST API + 스케줄러를 한 프로세스에서 실행",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
