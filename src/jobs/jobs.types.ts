@@ -59,10 +59,15 @@ export const TITLE_MAX = 1000;
 export const DESCRIPTION_MAX = 2000;
 
 /**
- * "1,000자"를 코드포인트로 센다. `String.length`(UTF-16)로 세면 이모지 하나가
- * 2자로 잡혀, DTO를 통과한 값이 로더에서 거부된다 — 성공한 POST가 재시작 불능
- * 파일을 만든다. class-validator가 surrogate pair를 한 자로 취급하므로 이 정의가
- * DTO와 일치한다.
+ * "1,000자"를 코드포인트 수로 센다. `String.length`(UTF-16 코드유닛)로 세면
+ * 이모지 하나가 2자로 잡혀, DTO를 통과한 값이 로더에서 거부된다 — 성공한 POST가
+ * 재시작 불능 파일을 만든다.
+ *
+ * DTO와의 일치는 라이브러리 동작에 기대지 않는다. `@MaxLength`가 무엇을 세는지는
+ * 구현 사항이므로(surrogate pair뿐 아니라 variation selector도 따로 처리한다),
+ * DTO 쪽도 이 함수를 부르는 `@MaxCharacters`를 쓴다.
+ *
+ * grapheme cluster가 아니라 코드포인트다 — `❤️`는 2, `👨‍👩‍👧‍👦`는 7로 센다.
  */
 export function countCharacters(value: string): number {
   return [...value].length;

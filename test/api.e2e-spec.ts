@@ -466,7 +466,11 @@ describe('Jobs API (e2e)', () => {
     it.each([
       ['ASCII', 'a'.repeat(1000), 'b'.repeat(2000)],
       // 코드포인트 1개가 UTF-16 2칸을 쓰므로, 두 정의가 어긋나면 여기서 갈린다.
-      ['이모지', '😀'.repeat(1000), '🎉'.repeat(2000)],
+      ['단일 코드포인트 이모지', '😀'.repeat(1000), '🎉'.repeat(2000)],
+      // ❤️는 하트 + variation selector로 2 코드포인트다. class-validator의
+      // @MaxLength는 variation selector를 따로 빼서 1로 세므로, DTO가 그쪽에
+      // 의존하면 여기서 어긋난다. 두 경계가 같은 함수를 쓰는지 확인한다.
+      ['조합 이모지', '❤️'.repeat(500), '❤️'.repeat(1000)],
       ['한글', '가'.repeat(1000), '나'.repeat(2000)],
     ])('%s 최대 길이로 생성한 Job이 재기동 후에도 남아 있다', async (_name, title, description) => {
       await boot();
@@ -491,6 +495,11 @@ describe('Jobs API (e2e)', () => {
       await http()
         .post('/jobs')
         .send({ title: 't', description: '🎉'.repeat(2001) })
+        .expect(400);
+      // 조합 이모지도 코드포인트 기준으로 거부되어야 한다 (❤️ 501개 = 1,002 코드포인트).
+      await http()
+        .post('/jobs')
+        .send({ title: '❤️'.repeat(501), description: 'd' })
         .expect(400);
 
       expect((await readJobsFile(dir)).jobs).toHaveLength(0);
