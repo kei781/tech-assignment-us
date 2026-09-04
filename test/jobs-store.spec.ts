@@ -77,6 +77,38 @@ describe('JobsStore', () => {
     });
 
     /**
+     * 인메모리 상태는 { jobs }만 담으므로, 최상위에 다른 키가 있는 파일을 받아들이면
+     * 다음 쓰기에서 그 키가 조용히 사라진다. 손상 파일을 자동 초기화하지 않는
+     * 방침과 정반대되는 데이터 손실이라, 로드 시점에 거부해야 한다.
+     */
+    describe('[RUN-005][DATA-001] 최상위 키 검증', () => {
+      it.each([
+        ['정의되지 않은 키가 섞임', { jobs: [], sentinel: { must: 'remain' } }],
+        ['jobs 외 다른 키만', { items: [] }],
+        ['jobs가 배열이 아님', { jobs: {} }],
+        ['최상위가 배열', []],
+        ['최상위가 배열 안 객체', [{ jobs: [] }]],
+      ])('%s이면 기동을 중단시킨다', async (_name, content) => {
+        await writeRawJobsFile(dir, JSON.stringify(content));
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      it('거부 시 원본 파일이 그대로 보존된다', async () => {
+        const raw = JSON.stringify({ jobs: [], sentinel: { must: 'remain' } });
+        await writeRawJobsFile(dir, raw);
+
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+
+        expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(raw);
+      });
+
+      it('오류 메시지가 어느 키가 문제인지 알려준다', async () => {
+        await writeRawJobsFile(dir, JSON.stringify({ jobs: [], sentinel: 1 }));
+        await expect(newStore().init()).rejects.toThrow(/sentinel/);
+      });
+    });
+
+    /**
      * parse는 되지만 스키마가 어긋난 레코드가 통과하면, 원인에서 멀리 떨어진
      * 런타임에서 TypeError로 터진다. 손상 JSON과 같은 취급으로 기동을 멈춘다.
      */

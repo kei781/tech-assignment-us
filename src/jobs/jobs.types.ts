@@ -132,11 +132,34 @@ export function findJobViolation(candidate: unknown, index: number): string | nu
   return null;
 }
 
-/** 레코드별 위반과 id 중복을 함께 본다. */
-export function findJobsFileViolation(jobs: readonly unknown[]): string | null {
+const JOBS_FILE_KEYS: readonly string[] = ['jobs'];
+
+/**
+ * 파일 전체를 검사한다 — 최상위 형태, 레코드별 위반, `id` 중복.
+ *
+ * 최상위 키를 정확히 검사하는 이유: 인메모리 상태는 `{ jobs }`만 담으므로,
+ * 다른 키가 있는 파일을 받아들이면 다음 쓰기에서 그 키가 조용히 사라진다.
+ * 손상 파일을 자동 초기화하지 않는 방침과 정반대되는 데이터 손실이다.
+ */
+export function findJobsFileViolation(raw: unknown): string | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return '최상위가 객체가 아닙니다';
+  }
+
+  const file = raw as Record<string, unknown>;
+
+  const unknownKeys = Object.keys(file).filter((key) => !JOBS_FILE_KEYS.includes(key));
+  if (unknownKeys.length > 0) {
+    return `최상위에 정의되지 않은 키가 있습니다: ${unknownKeys.join(', ')}`;
+  }
+
+  if (!Array.isArray(file.jobs)) {
+    return '최상위 jobs가 배열이 아닙니다';
+  }
+
   const seenIds = new Set<string>();
 
-  for (const [index, candidate] of jobs.entries()) {
+  for (const [index, candidate] of file.jobs.entries()) {
     const violation = findJobViolation(candidate, index);
     if (violation) return violation;
 

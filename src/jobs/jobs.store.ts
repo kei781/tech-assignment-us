@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { Config, JsonDB } from 'node-json-db';
 import { APP_CONFIG, AppConfig, CLOCK, Clock, isoNow } from '../common/config';
 import { APP_LOGGER, AppLogger } from '../common/logger';
-import { emptyJobsFile, findJobsFileViolation, Job, JobsFile } from './jobs.types';
+import { emptyJobsFile, findJobsFileViolation, JobsFile } from './jobs.types';
 
 export class JobsFileLoadError extends Error {
   constructor(
@@ -150,23 +150,15 @@ export class JobsStore implements OnModuleInit {
       );
     }
 
-    if (typeof raw !== 'object' || raw === null || !Array.isArray((raw as JobsFile).jobs)) {
-      throw new JobsFileLoadError(
-        `jobs.json의 최상위 jobs 배열을 찾을 수 없습니다 (${filePath}). 데이터 보호를 위해 자동 초기화하지 않습니다.`,
-      );
-    }
-
-    const jobs = (raw as { jobs: unknown[] }).jobs;
-
-    const violation = findJobsFileViolation(jobs);
+    const violation = findJobsFileViolation(raw);
     if (violation) {
       throw new JobsFileLoadError(
-        `jobs.json의 레코드가 스키마를 위반합니다 (${filePath}): ${violation}. 데이터 보호를 위해 자동 초기화하지 않습니다.`,
+        `jobs.json이 스키마를 위반합니다 (${filePath}): ${violation}. 데이터 보호를 위해 자동 초기화하지 않습니다.`,
       );
     }
 
     // getObject는 내부 참조를 반환한다.
-    return { jobs: (jobs as Job[]).map((job) => ({ ...job })) };
+    return { jobs: (raw as JobsFile).jobs.map((job) => ({ ...job })) };
   }
 
   /**
