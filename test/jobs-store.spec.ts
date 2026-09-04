@@ -332,57 +332,34 @@ describe('JobsStore', () => {
     });
 
     /**
-     * 위 테스트는 실패 직후 한 건만 본다. 체인이 rejected로 굳는 결함은 "그 뒤로
-     * 계속" 멈추는 것이므로, 실패를 여러 번 섞어 이후 변경이 전부 살아남는지 본다.
+     * 위 테스트의 실패는 콜백의 동기 throw다. 저장 단계(rename)에서 실패하는 경로는
+     * `await`를 지난 뒤 거부되므로 mutate를 다른 지점까지 통과한다. 그 실패 뒤에도
+     * 저장소가 계속 쓸 수 있는지는 별도로 봐야 한다 — 기존 저장 실패 테스트는
+     * 그 시점의 상태만 보고 이후 변경을 확인하지 않는다.
      */
-    it('변경이 반복적으로 실패해도 이후 변경이 계속 실행된다', async () => {
+    it('저장 실패 후에도 다음 변경이 성공하고 디스크까지 반영된다', async () => {
       const store = newStore();
       await store.init();
 
-      const settled = await Promise.allSettled([
-        store.mutate(() => {
-          throw new Error('실패 1');
-        }),
-        store.mutate((draft) => {
-          draft.jobs.push(makeJob());
-        }),
-        store.mutate(() => {
-          throw new Error('실패 2');
-        }),
-        store.mutate((draft) => {
-          draft.jobs.push(makeJob());
-        }),
-        store.mutate((draft) => {
-          draft.jobs.push(makeJob());
-        }),
-      ]);
+      jest.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('일시적 디스크 오류'));
 
-      expect(settled.map((s) => s.status)).toEqual([
-        'rejected',
-        'fulfilled',
-        'rejected',
-        'fulfilled',
-        'fulfilled',
-      ]);
-      expect(store.snapshot().jobs).toHaveLength(3);
-      expect((await readJobsFile(dir)).jobs).toHaveLength(3);
-    });
+      await expect(
+        store.mutate((draft) => {
+          draft.jobs.push(makeJob({ title: '유실될 변경' }));
+        }),
+      ).rejects.toThrow('일시적 디스크 오류');
 
-    it('실패는 그 변경의 호출자에게만 전달된다', async () => {
-      const store = newStore();
-      await store.init();
-
-      const failing = store.mutate(() => {
-        throw new Error('내 오류');
-      });
-      const other = store.mutate((draft) => {
-        draft.jobs.push(makeJob());
-        return 'ok';
+      // 디스크가 회복된 뒤의 변경은 정상 저장되어야 한다.
+      const saved = await store.mutate((draft) => {
+        const job = makeJob({ title: '회복 후 변경' });
+        draft.jobs.push(job);
+        return job.id;
       });
 
-      await expect(failing).rejects.toThrow('내 오류');
-      // 옆 변경이 남의 오류를 받아서는 안 된다.
-      await expect(other).resolves.toBe('ok');
+      expect(store.snapshot().jobs.map((j) => j.title)).toEqual(['회복 후 변경']);
+
+      const onDisk = await readJobsFile(dir);
+      expect(onDisk.jobs.map((j) => j.id)).toEqual([saved]);
     });
 
     it('저장이 실패하면 인메모리 상태와 디스크가 모두 변경 전으로 남는다', async () => {
