@@ -338,8 +338,10 @@ create ── 스케줄러 선점 ──▶ pending ── 처리 완료 ──�
 | `CONSUME_INTERVAL_MS` | 60,000 |
 | `JOB_PROCESSING_MS` | 5,000 |
 | `SHUTDOWN_DRAIN_MS` | 10,000 |
+| `SCHEDULER_ENABLED` | `true` |
 
-- 제약: `JOB_PROCESSING_MS < CONSUME_INTERVAL_MS` — 그렇지 않으면 [SCH-002] guard가 매 tick 발동해 실효 처리량이 절반 이하로 떨어진다.
+- 제약: `JOB_PROCESSING_MS < CONSUME_INTERVAL_MS` — 그렇지 않으면 [SCH-002] guard가 매 tick 발동해 실효 처리량이 절반 이하로 떨어진다. 위반 시 기동을 막지는 않고 `WARN`을 남긴다.
+- `SCHEDULER_ENABLED=false`면 interval 등록과 기동 즉시 tick([SCH-001])을 모두 건너뛴다. 테스트가 tick 시점을 직접 통제하기 위한 seam이며([TST-002]), API만 띄우는 운영 구성에도 쓸 수 있다.
 
 ---
 
@@ -358,7 +360,7 @@ src/
 │  ├─ jobs.store.ts     # mutex + 원자적 저장 + 기동 복구
 │  └─ dto/
 └─ common/
-   ├─ logging/          # logs.txt 로거 + 요청 로깅 인터셉터
+   ├─ logging/          # logs.txt 로거 + 요청 로깅 미들웨어 (부록 A #13)
    ├─ filters/          # 공통 에러 응답 형식
    └─ config.ts
 data/
@@ -428,6 +430,8 @@ data/
 | 10 | `jobs.json` 저장 | `node-json-db` save | 임시 파일 + `fsync` + 원자적 `rename` | 저장 중 종료로 인한 파일 손상 방지 |
 | 11 | 처리 시간 | 1분 | 5초 (`JOB_PROCESSING_MS`) | 과제가 허용한 자유 가정. `CONSUME_INTERVAL_MS`보다 작게 두어 [SCH-002] guard가 상시 발동하지 않게 한다 |
 | 12 | 기동 시 즉시 tick | 없음 | [SCH-001] | 확인을 위해 첫 주기를 기다리지 않게 한다 |
+| 13 | 요청 로깅 방식 | 인터셉터 | **미들웨어** (`res.on('finish')`) | 인터셉터는 exception filter가 상태 코드를 확정하기 전에 종료되므로 에러 응답의 실제 코드를 알 수 없다. 미들웨어는 라우트 미매칭·validation 실패·filter가 만든 응답까지 최종 코드로 기록해 [LOG-003]의 "모든 요청"을 만족한다 |
+| 14 | `SCHEDULER_ENABLED` | 없음 | §7에 추가 | tick 시점을 테스트가 통제하기 위한 seam([TST-002]). API만 띄우는 운영 구성에도 쓸 수 있다 |
 
 ## 부록 B. 초기설계 대비 확정 사항
 

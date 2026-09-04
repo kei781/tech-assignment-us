@@ -3,10 +3,11 @@ node_modules/
 
 # build output
 dist/
+*.tsbuildinfo
 
 # runtime data (샘플 데이터인 data/jobs.json은 커밋 대상)
-data/locks/
 logs.txt
+data/jobs.json.*.tmp
 
 # env
 .env

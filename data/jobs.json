@@ -1,0 +1,36 @@
+{
+  "jobs": [
+    {
+      "id": "3f1c9a6e-5b47-4d2a-9c8e-1a2b3c4d5e6f",
+      "title": "월간 정산 리포트 생성",
+      "description": "지난달 거래 내역을 집계해 정산 리포트를 만든다. 이미 처리가 끝난 Job이므로 PATCH는 409(이미 완료된 프로세스입니다.)로 거부된다.",
+      "status": "done",
+      "createdAt": "2026-09-01T00:10:00.000Z",
+      "updatedAt": "2026-09-01T00:11:00.000Z"
+    },
+    {
+      "id": "7a2d4b18-6c93-4e51-8f7a-2b3c4d5e6f70",
+      "title": "이미지 썸네일 일괄 생성",
+      "description": "직전 실행이 처리 도중 종료되어 pending으로 남은 Job. 기동 시 [CON-006] 기동 복구가 create로 되돌린 뒤 스케줄러가 다시 처리한다.",
+      "status": "pending",
+      "createdAt": "2026-09-02T09:00:00.000Z",
+      "updatedAt": "2026-09-02T09:00:30.000Z"
+    },
+    {
+      "id": "9c3e5f2a-7d18-4a62-b93c-3c4d5e6f7081",
+      "title": "가입 환영 메일 발송",
+      "description": "아직 선점되지 않은 대기 Job. 스케줄러 tick이 createdAt 오름차순으로 선점하므로 이 Job이 먼저 처리된다.",
+      "status": "create",
+      "createdAt": "2026-09-02T10:00:00.000Z",
+      "updatedAt": "2026-09-02T10:00:00.000Z"
+    },
+    {
+      "id": "b5f7a3c1-8e29-4b73-a04d-4d5e6f708192",
+      "title": "검색 색인 재구축",
+      "description": "대기 Job 2번째. GET /jobs/search?status=create 로 조회되며, PATCH로 제목·설명을 수정할 수 있다.",
+      "status": "create",
+      "createdAt": "2026-09-02T11:30:00.000Z",
+      "updatedAt": "2026-09-02T11:30:00.000Z"
+    }
+  ]
+}
