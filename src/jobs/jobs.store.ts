@@ -104,13 +104,16 @@ export class JobsStore implements OnModuleInit {
   }
 
   private runExclusive<T>(task: () => Promise<T>): Promise<T> {
-    // 성공·실패 양쪽에 같은 콜백을 연결한다. 한쪽만 연결하면 앞선 변경이 실패했을 때
-    // 체인이 끊겨 이후 모든 변경이 영구히 멈춘다.
-    const result = this.mutexChain.then(task, task);
+    const result = this.mutexChain.then(task);
+
+    // 성공·실패를 모두 undefined로 흡수해 체인을 항상 fulfilled로 유지한다.
+    // 한쪽만 연결하면 앞선 변경이 실패했을 때 체인이 rejected로 굳어 이후 모든
+    // 변경이 영구히 멈춘다. 실패는 result를 통해 그 변경의 호출자에게만 간다.
     this.mutexChain = result.then(
       () => undefined,
       () => undefined,
     );
+
     return result;
   }
 

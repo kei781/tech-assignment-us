@@ -331,6 +331,60 @@ describe('JobsStore', () => {
       expect(store.snapshot().jobs).toHaveLength(1);
     });
 
+    /**
+     * 위 테스트는 실패 직후 한 건만 본다. 체인이 rejected로 굳는 결함은 "그 뒤로
+     * 계속" 멈추는 것이므로, 실패를 여러 번 섞어 이후 변경이 전부 살아남는지 본다.
+     */
+    it('변경이 반복적으로 실패해도 이후 변경이 계속 실행된다', async () => {
+      const store = newStore();
+      await store.init();
+
+      const settled = await Promise.allSettled([
+        store.mutate(() => {
+          throw new Error('실패 1');
+        }),
+        store.mutate((draft) => {
+          draft.jobs.push(makeJob());
+        }),
+        store.mutate(() => {
+          throw new Error('실패 2');
+        }),
+        store.mutate((draft) => {
+          draft.jobs.push(makeJob());
+        }),
+        store.mutate((draft) => {
+          draft.jobs.push(makeJob());
+        }),
+      ]);
+
+      expect(settled.map((s) => s.status)).toEqual([
+        'rejected',
+        'fulfilled',
+        'rejected',
+        'fulfilled',
+        'fulfilled',
+      ]);
+      expect(store.snapshot().jobs).toHaveLength(3);
+      expect((await readJobsFile(dir)).jobs).toHaveLength(3);
+    });
+
+    it('실패는 그 변경의 호출자에게만 전달된다', async () => {
+      const store = newStore();
+      await store.init();
+
+      const failing = store.mutate(() => {
+        throw new Error('내 오류');
+      });
+      const other = store.mutate((draft) => {
+        draft.jobs.push(makeJob());
+        return 'ok';
+      });
+
+      await expect(failing).rejects.toThrow('내 오류');
+      // 옆 변경이 남의 오류를 받아서는 안 된다.
+      await expect(other).resolves.toBe('ok');
+    });
+
     it('저장이 실패하면 인메모리 상태와 디스크가 모두 변경 전으로 남는다', async () => {
       const store = newStore();
       await store.init();

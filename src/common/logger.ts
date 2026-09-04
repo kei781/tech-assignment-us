@@ -42,6 +42,10 @@ export class FileLogger implements AppLogger, OnApplicationShutdown {
   log(level: LogLevel, scope: LogScope, message: string): void {
     const line = formatLogLine(isoNow(this.clock), level, scope, message);
 
+    // 여기서는 체인 자체를 결과로 덮으므로, 실패 슬롯이 체인을 지키는 유일한 수단이다
+    // (JobsStore.runExclusive처럼 흡수 전용 단계를 따로 두지 않는다).
+    // append가 내부에서 오류를 삼키니 지금은 도달하지 않지만, 그 보장이 깨지면
+    // 이 슬롯이 없는 로거는 첫 실패 이후 아무것도 기록하지 못한다.
     this.appendChain = this.appendChain.then(
       () => this.append(line),
       () => this.append(line),
