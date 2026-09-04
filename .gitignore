@@ -9,6 +9,9 @@ dist/
 logs.txt
 data/jobs.json.*.tmp
 
+# README가 안내하는 샘플 격리용 실행 경로
+tmp/
+
 # env
 .env
 .env.*

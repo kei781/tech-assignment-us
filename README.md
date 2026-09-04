@@ -51,7 +51,7 @@ $env:JOB_PROCESSING_MS=500; $env:CONSUME_INTERVAL_MS=2000; npm run start
 npm test
 ```
 
-129개 테스트 / 6개 스위트입니다. 실제 스케줄러 주기나 처리 시간을 기다리지 않습니다([TST-002]) — 시계와 처리 로직을 주입하고 tick을 직접 호출합니다.
+138개 테스트 / 7개 스위트입니다. 실제 스케줄러 주기나 처리 시간을 기다리지 않습니다([TST-002]) — 시계와 처리 로직을 주입하고 tick을 직접 호출합니다.
 
 | 스위트 | 검증 대상 |
 |---|---|
@@ -61,6 +61,7 @@ npm test
 | `test/concurrency.spec.ts` | **동시성 시나리오 8종** ([TST-003]) |
 | `test/logging.spec.ts` | 로그 형식·append·best-effort |
 | `test/config.spec.ts` | 환경 변수 로드·범위 검증·실행 전제 |
+| `test/sample-data.spec.ts` | 커밋된 샘플 데이터가 3상태와 스키마를 유지하는지 ([DATA-004]) |
 
 ### 설정값
 
@@ -83,6 +84,20 @@ ms 값은 정수여야 하고 `2,147,483,647`(Node timer의 32-bit 한계)을 �
 `data/jobs.json`에 4건이 들어 있습니다 — `done` 1건, `pending` 1건, `create` 2건.
 
 `pending` 샘플은 의도적인 것입니다. 기동하면 [기동 복구](#기동-복구가-복잡한-생존-감지를-대체한다)가 이 Job을 `create`로 되돌리고, 이어서 스케줄러가 처리합니다. 조회뿐 아니라 복구 규칙의 동작까지 한 번에 확인할 수 있습니다.
+
+> **앱을 실행하면 이 파일이 변경됩니다.** 스케줄러가 Job을 처리하므로 몇 분 뒤에는 전부 `done`이 됩니다. 정상 동작이며, 3상태 샘플로 되돌리려면:
+>
+> ```bash
+> git checkout -- data/jobs.json
+> ```
+>
+> 샘플을 건드리지 않고 실행하려면 데이터 파일 경로를 옮기세요.
+>
+> ```bash
+> JOBS_FILE_PATH=./tmp/jobs.json npm run start
+> ```
+>
+> `test/sample-data.spec.ts`가 커밋된 샘플이 3상태를 유지하는지 검증하므로, 실행 후 상태를 실수로 커밋하면 `npm test`에서 걸립니다.
 
 ---
 

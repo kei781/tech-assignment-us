@@ -287,7 +287,7 @@ describe('Jobs API (e2e)', () => {
   });
 
   describe('[API-050]~[API-053] PATCH /jobs/:id', () => {
-    it('create 상태 job 수정: 200 + 갱신된 job + updatedAt 갱신', async () => {
+    it('[API-051] create 상태 job 수정: 200 + 갱신된 job + updatedAt 갱신', async () => {
       const job = makeJob({ status: 'create', updatedAt: '2026-09-01T00:00:00.000Z' });
       await seedJobs(dir, [job]);
       await boot();
@@ -357,7 +357,7 @@ describe('Jobs API (e2e)', () => {
       await http().patch('/jobs/not-a-uuid').send({ title: 'x' }).expect(400);
     });
 
-    it('[CON-005] pending(처리 중) 상태: 409 + 처리중 메시지, 내용 불변', async () => {
+    it('[API-051][CON-005] pending(처리 중) 상태: 409 + 처리중 메시지, 내용 불변', async () => {
       const job = makeJob({ status: 'create' });
       await seedJobs(dir, [job]);
       await boot();
