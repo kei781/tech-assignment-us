@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { Config, JsonDB } from 'node-json-db';
 import { APP_CONFIG, AppConfig, CLOCK, Clock, isoNow } from '../common/config';
 import { APP_LOGGER, AppLogger } from '../common/logger';
-import { emptyJobsFile, JobsFile } from './jobs.types';
+import { emptyJobsFile, findJobsFileViolation, Job, JobsFile } from './jobs.types';
 
 export class JobsFileLoadError extends Error {
   constructor(
@@ -156,8 +156,17 @@ export class JobsStore implements OnModuleInit {
       );
     }
 
+    const jobs = (raw as { jobs: unknown[] }).jobs;
+
+    const violation = findJobsFileViolation(jobs);
+    if (violation) {
+      throw new JobsFileLoadError(
+        `jobs.json의 레코드가 스키마를 위반합니다 (${filePath}): ${violation}. 데이터 보호를 위해 자동 초기화하지 않습니다.`,
+      );
+    }
+
     // getObject는 내부 참조를 반환한다.
-    return { jobs: (raw as JobsFile).jobs.map((job) => ({ ...job })) };
+    return { jobs: (jobs as Job[]).map((job) => ({ ...job })) };
   }
 
   /**

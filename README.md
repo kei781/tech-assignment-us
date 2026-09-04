@@ -97,6 +97,12 @@ ms 값은 정수여야 하고 `2,147,483,647`(Node timer의 32-bit 한계)을 �
 > JOBS_FILE_PATH=./tmp/jobs.json npm run start
 > ```
 >
+> Windows PowerShell:
+>
+> ```powershell
+> $env:JOBS_FILE_PATH="./tmp/jobs.json"; npm run start
+> ```
+>
 > `test/sample-data.spec.ts`가 커밋된 샘플이 3상태를 유지하는지 검증하므로, 실행 후 상태를 실수로 커밋하면 `npm test`에서 걸립니다.
 
 ---

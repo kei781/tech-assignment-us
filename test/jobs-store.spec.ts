@@ -76,6 +76,75 @@ describe('JobsStore', () => {
       await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
     });
 
+    /**
+     * parse는 되지만 스키마가 어긋난 레코드가 통과하면, 원인에서 멀리 떨어진
+     * 런타임에서 TypeError로 터진다. 손상 JSON과 같은 취급으로 기동을 멈춘다.
+     */
+    describe('[RUN-005][DATA-002] 레코드 단위 스키마 검증', () => {
+      const valid = {
+        id: '3f1c9a6e-5b47-4d2a-9c8e-1a2b3c4d5e6f',
+        title: 't',
+        description: 'd',
+        status: 'create',
+        createdAt: '2026-09-01T00:00:00.000Z',
+        updatedAt: '2026-09-01T00:00:00.000Z',
+      };
+
+      const seedRaw = async (jobs: unknown[]): Promise<void> => {
+        await writeRawJobsFile(dir, JSON.stringify({ jobs }));
+      };
+
+      it('빈 객체 레코드는 기동을 중단시킨다', async () => {
+        await seedRaw([{}]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      it.each([
+        ['id 누락', { ...valid, id: undefined }],
+        ['id가 UUID v4가 아님', { ...valid, id: '550e8400-e29b-11d4-0716-446655440000' }],
+        ['title 누락', { ...valid, title: undefined }],
+        ['title이 문자열 아님', { ...valid, title: 123 }],
+        ['title 공백만', { ...valid, title: '   ' }],
+        ['title 길이 초과', { ...valid, title: 'a'.repeat(1001) }],
+        ['description 누락', { ...valid, description: undefined }],
+        ['description 길이 초과', { ...valid, description: 'a'.repeat(2001) }],
+        ['status가 enum 아님', { ...valid, status: 'unknown' }],
+        ['createdAt이 ISO UTC 아님', { ...valid, createdAt: '2026-09-01' }],
+        ['updatedAt 누락', { ...valid, updatedAt: undefined }],
+        ['정의되지 않은 키 포함', { ...valid, extra: 1 }],
+        ['레코드가 객체 아님', 'not-an-object'],
+      ])('%s이면 기동을 중단시킨다', async (_name, record) => {
+        await seedRaw([record]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      it('id가 중복되면 기동을 중단시킨다', async () => {
+        await seedRaw([valid, { ...valid, title: 'other' }]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      it('오류 메시지가 몇 번째 레코드의 무엇이 문제인지 알려준다', async () => {
+        await seedRaw([valid, { ...valid, id: 'nope' }]);
+        await expect(newStore().init()).rejects.toThrow(/jobs\[1\].*id/);
+      });
+
+      it('규칙을 만족하는 레코드는 정상 로드된다', async () => {
+        await seedRaw([valid]);
+        const store = newStore();
+        await store.init();
+        expect(store.snapshot().jobs).toEqual([valid]);
+      });
+
+      it('검증 실패 시 원본 파일을 덮어쓰지 않는다', async () => {
+        await seedRaw([{}]);
+        const before = await fs.readFile(jobsJsonPath(dir), 'utf8');
+
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+
+        expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(before);
+      });
+    });
+
     it('init을 두 번 호출해도 데이터를 다시 덮어쓰지 않는다', async () => {
       const job = makeJob();
       await seedJobs(dir, [job]);
