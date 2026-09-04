@@ -3,13 +3,18 @@ import {
   IsIn,
   IsOptional,
   IsString,
-  MaxLength,
   MinLength,
   registerDecorator,
   ValidationArguments,
   ValidationOptions,
 } from 'class-validator';
-import { JOB_STATUSES, JobStatus } from './jobs.types';
+import {
+  countCharacters,
+  DESCRIPTION_MAX,
+  JOB_STATUSES,
+  JobStatus,
+  TITLE_MAX,
+} from './jobs.types';
 
 /** 문자열이 아니면 그대로 넘겨 타입 검사에 걸리게 한다. */
 function trimIfString({ value }: TransformFnParams): unknown {
@@ -25,6 +30,34 @@ function trimToUndefined({ value }: TransformFnParams): unknown {
   if (typeof value !== 'string') return value;
   const trimmed = value.trim();
   return trimmed === '' ? undefined : trimmed;
+}
+
+/**
+ * 길이 제한을 `countCharacters`로 판정한다. class-validator의 `@MaxLength`를
+ * 쓰면 그쪽 내부 계수 방식에 의존하게 되고, 로더와 어긋나는 순간 성공한 POST가
+ * 재시작 불능 파일을 만든다. 두 경계가 같은 함수를 쓰게 해서 어긋날 여지를 없앤다.
+ */
+function MaxCharacters(max: number, validationOptions?: ValidationOptions) {
+  return function (target: object, propertyName: string): void {
+    registerDecorator({
+      name: 'maxCharacters',
+      target: target.constructor,
+      propertyName,
+      constraints: [max],
+      options: validationOptions,
+      validator: {
+        validate(value: unknown, args: ValidationArguments): boolean {
+          const [limit] = args.constraints as [number];
+          // 문자열이 아닌 경우는 @IsString이 보고하도록 통과시킨다.
+          return typeof value !== 'string' || countCharacters(value) <= limit;
+        },
+        defaultMessage(args: ValidationArguments): string {
+          const [limit] = args.constraints as [number];
+          return `${args.property}은(는) 최대 ${limit}자입니다.`;
+        },
+      },
+    });
+  };
 }
 
 function AtLeastOneField(fields: string[], validationOptions?: ValidationOptions) {
@@ -55,13 +88,13 @@ export class CreateJobDto {
   @Transform(trimIfString)
   @IsString({ message: 'title은 문자열이어야 합니다.' })
   @MinLength(1, { message: 'title은 1자 이상이어야 합니다.' })
-  @MaxLength(1000, { message: 'title은 최대 1,000자입니다.' })
+  @MaxCharacters(TITLE_MAX, { message: 'title은 최대 1,000자입니다.' })
   title!: string;
 
   @Transform(trimIfString)
   @IsString({ message: 'description은 문자열이어야 합니다.' })
   @MinLength(1, { message: 'description은 1자 이상이어야 합니다.' })
-  @MaxLength(2000, { message: 'description은 최대 2,000자입니다.' })
+  @MaxCharacters(DESCRIPTION_MAX, { message: 'description은 최대 2,000자입니다.' })
   description!: string;
 }
 
@@ -77,14 +110,14 @@ export class UpdateJobDto {
   @Transform(trimIfString)
   @IsString({ message: 'title은 문자열이어야 합니다.' })
   @MinLength(1, { message: 'title은 1자 이상이어야 합니다.' })
-  @MaxLength(1000, { message: 'title은 최대 1,000자입니다.' })
+  @MaxCharacters(TITLE_MAX, { message: 'title은 최대 1,000자입니다.' })
   title?: string;
 
   @IsOptional()
   @Transform(trimIfString)
   @IsString({ message: 'description은 문자열이어야 합니다.' })
   @MinLength(1, { message: 'description은 1자 이상이어야 합니다.' })
-  @MaxLength(2000, { message: 'description은 최대 2,000자입니다.' })
+  @MaxCharacters(DESCRIPTION_MAX, { message: 'description은 최대 2,000자입니다.' })
   description?: string;
 }
 

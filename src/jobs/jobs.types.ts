@@ -55,14 +55,36 @@ const JOB_KEYS: readonly string[] = [
   'updatedAt',
 ];
 
-const TITLE_MAX = 1000;
-const DESCRIPTION_MAX = 2000;
+export const TITLE_MAX = 1000;
+export const DESCRIPTION_MAX = 2000;
+
+/**
+ * "1,000자"를 코드포인트로 센다. `String.length`(UTF-16)로 세면 이모지 하나가
+ * 2자로 잡혀, DTO를 통과한 값이 로더에서 거부된다 — 성공한 POST가 재시작 불능
+ * 파일을 만든다. class-validator가 surrogate pair를 한 자로 취급하므로 이 정의가
+ * DTO와 일치한다.
+ */
+export function countCharacters(value: string): number {
+  return [...value].length;
+}
 
 function violationOfText(value: unknown, field: string, max: number): string | null {
   if (typeof value !== 'string') return `${field}이(가) 문자열이 아닙니다`;
   if (value.trim().length < 1) return `${field}이(가) 비어 있습니다`;
-  if (value.length > max) return `${field}이(가) ${max}자를 초과합니다`;
+  // [DATA-002]는 trim된 값을 저장한다고 규정한다.
+  if (value !== value.trim()) return `${field}에 앞뒤 공백이 있습니다`;
+  if (countCharacters(value) > max) return `${field}이(가) ${max}자를 초과합니다`;
   return null;
+}
+
+/**
+ * 형식만 보면 `2026-99-99T99:99:99.999Z`가 통과하고, `2026-02-30`은 JS Date가
+ * `2026-03-02`로 넘겨버려 조용히 다른 값이 된다. 왕복시켜 실재하는 시각인지 본다.
+ */
+function isRealIsoInstant(value: string): boolean {
+  if (!ISO_8601_UTC.test(value)) return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
 /**
@@ -102,8 +124,8 @@ export function findJobViolation(candidate: unknown, index: number): string | nu
 
   for (const field of ['createdAt', 'updatedAt'] as const) {
     const value = job[field];
-    if (typeof value !== 'string' || !ISO_8601_UTC.test(value)) {
-      return `${at}.${field}이(가) ISO 8601 UTC가 아닙니다`;
+    if (typeof value !== 'string' || !isRealIsoInstant(value)) {
+      return `${at}.${field}이(가) 실재하는 ISO 8601 UTC 시각이 아닙니다`;
     }
   }
 

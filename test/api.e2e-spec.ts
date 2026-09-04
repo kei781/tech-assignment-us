@@ -452,6 +452,82 @@ describe('Jobs API (e2e)', () => {
     });
   });
 
+  /**
+   * DTO와 로더가 길이·공백을 다르게 판정하면, 성공한 POST가 재시작 불능 파일을
+   * 만든다. 두 경계가 같은 정의를 쓰는지 실제 왕복으로 확인한다.
+   */
+  describe('[RUN-006][TST-006] API가 저장한 데이터는 재기동 시 다시 로드된다', () => {
+    /** 재기동을 모사한다 — 같은 파일에 새 앱을 띄운다. */
+    const restart = async (): Promise<void> => {
+      await app.close();
+      ({ app, service, logger } = await createTestApp({ config, clock }));
+    };
+
+    it.each([
+      ['ASCII', 'a'.repeat(1000), 'b'.repeat(2000)],
+      // 코드포인트 1개가 UTF-16 2칸을 쓰므로, 두 정의가 어긋나면 여기서 갈린다.
+      ['이모지', '😀'.repeat(1000), '🎉'.repeat(2000)],
+      ['한글', '가'.repeat(1000), '나'.repeat(2000)],
+    ])('%s 최대 길이로 생성한 Job이 재기동 후에도 남아 있다', async (_name, title, description) => {
+      await boot();
+
+      const created = await http().post('/jobs').send({ title, description }).expect(201);
+      const id = created.body.job.id;
+
+      await restart();
+
+      const found = await http().get('/jobs/' + id).expect(200);
+      expect(found.body.job.title).toBe(title);
+      expect(found.body.job.description).toBe(description);
+    });
+
+    it('DTO가 거부하는 길이는 로더 기준도 초과한다 (경계가 어긋나지 않는다)', async () => {
+      await boot();
+
+      await http()
+        .post('/jobs')
+        .send({ title: '😀'.repeat(1001), description: 'd' })
+        .expect(400);
+      await http()
+        .post('/jobs')
+        .send({ title: 't', description: '🎉'.repeat(2001) })
+        .expect(400);
+
+      expect((await readJobsFile(dir)).jobs).toHaveLength(0);
+    });
+
+    it('공백이 섞인 입력도 trim되어 저장되므로 재기동을 막지 않는다', async () => {
+      await boot();
+
+      const created = await http()
+        .post('/jobs')
+        .send({ title: '  제목  ', description: '  설명  ' })
+        .expect(201);
+
+      await restart();
+
+      const found = await http().get('/jobs/' + created.body.job.id).expect(200);
+      expect(found.body.job.title).toBe('제목');
+    });
+
+    it('PATCH로 최대 길이까지 수정한 Job도 재기동 후 로드된다', async () => {
+      const job = makeJob({ status: 'create' });
+      await seedJobs(dir, [job]);
+      await boot();
+
+      const title = '😀'.repeat(1000);
+      await http()
+        .patch('/jobs/' + job.id)
+        .send({ title })
+        .expect(200);
+
+      await restart();
+
+      const found = await http().get('/jobs/' + job.id).expect(200);
+      expect(found.body.job.title).toBe(title);
+    });
+  });
+
   describe('[CON-004] 조회는 부수 효과가 없다', () => {
     it('조회 계열 요청은 jobs.json을 변경하지 않는다', async () => {
       const job = makeJob();

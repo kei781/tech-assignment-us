@@ -118,6 +118,50 @@ describe('JobsStore', () => {
         await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
       });
 
+      /**
+       * [DATA-002]는 trim된 값을 저장한다고 규정한다. 로더가 공백을 허용하면
+       * API가 만든 데이터와 손으로 고친 데이터의 규칙이 갈린다.
+       */
+      it.each(['  padded  ', 'trailing ', ' leading'])(
+        'title에 앞뒤 공백이 있으면(%j) 기동을 중단시킨다',
+        async (title) => {
+          await seedRaw([{ ...valid, title }]);
+          await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+        },
+      );
+
+      /**
+       * 형식만 보는 정규식은 존재하지 않는 시각을 통과시킨다. `2026-02-30`은
+       * JS Date가 `2026-03-02`로 넘겨버려 조용히 다른 값이 된다.
+       */
+      it.each([
+        '2026-99-99T99:99:99.999Z',
+        '2026-13-01T00:00:00.000Z',
+        '2026-02-30T00:00:00.000Z',
+        '2026-09-01T25:00:00.000Z',
+      ])('실제로 존재하지 않는 시각(%s)이면 기동을 중단시킨다', async (createdAt) => {
+        await seedRaw([{ ...valid, createdAt }]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      /**
+       * 길이는 코드포인트로 센다 — DTO(class-validator)와 같은 정의여야
+       * 성공한 POST가 재시작 불능 파일을 만들지 않는다.
+       */
+      it('이모지로 최대 길이를 채운 레코드는 정상 로드된다', async () => {
+        await seedRaw([{ ...valid, title: '😀'.repeat(1000), description: '🎉'.repeat(2000) }]);
+
+        const store = newStore();
+        await store.init();
+
+        expect([...store.snapshot().jobs[0].title]).toHaveLength(1000);
+      });
+
+      it('코드포인트가 한 자 초과하면 기동을 중단시킨다', async () => {
+        await seedRaw([{ ...valid, title: '😀'.repeat(1001) }]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
       it('id가 중복되면 기동을 중단시킨다', async () => {
         await seedRaw([valid, { ...valid, title: 'other' }]);
         await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
