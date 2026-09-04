@@ -1,11 +1,7 @@
-/**
- * 테스트 공용 유틸. SPEC [TST-002]
- */
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { Clock } from '../../src/common/clock';
-import { AppConfig, DEFAULT_CONFIG } from '../../src/common/config';
+import { AppConfig, Clock, DEFAULT_CONFIG } from '../../src/common/config';
 import { emptyJobsFile, Job, JobsFile, JobStatus } from '../../src/jobs/jobs.types';
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -26,11 +22,7 @@ export async function rmDir(dir: string): Promise<void> {
   await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
-/**
- * 테스트 설정. [TST-002]
- *  - schedulerEnabled: false — tick 시점을 테스트가 직접 통제한다.
- *  - jobProcessingMs: 0 — 실제 처리 대기 없음.
- */
+/** tick 시점과 처리 시간을 테스트가 전부 통제하도록 스케줄러를 끄고 대기를 없앤다. */
 export function testConfig(dir: string, overrides: Partial<AppConfig> = {}): AppConfig {
   return {
     ...DEFAULT_CONFIG,
@@ -43,9 +35,7 @@ export function testConfig(dir: string, overrides: Partial<AppConfig> = {}): App
   };
 }
 
-/**
- * [TST-002] 수동 제어 시계. advance() 전까지 고정되어 결정적이다.
- */
+/** advance() 전까지 시각이 고정되어 단언이 결정적이다. */
 export class ManualClock implements Clock {
   constructor(private t: Date = new Date('2026-09-04T12:00:00.000Z')) {}
   now(): Date {

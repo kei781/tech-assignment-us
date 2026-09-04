@@ -1,14 +1,12 @@
 /**
- * 스케줄러 테스트. SPEC §5 [SCH-001] ~ [SCH-005], [CON-007], [LOG-004]
- *
- * [TST-002] 실제 주기나 처리 시간을 기다리지 않는다.
- * tick은 tickOnce()로 직접 호출하고, 처리 로직은 ControllableTask로 교체한다.
+ * 실제 주기나 처리 시간을 기다리지 않는다 — tick은 tickOnce()로 직접 호출하고,
+ * 처리 로직은 ControllableTask로 교체한다.
  */
 import { INestApplication } from '@nestjs/common';
 import { promises as fsPromises } from 'node:fs';
 import request from 'supertest';
 import { AppConfig } from '../src/common/config';
-import { AppLogger } from '../src/common/logging/app-logger';
+import { AppLogger } from '../src/common/logger';
 import { JobsProcessor } from '../src/jobs/jobs.processor';
 import { JobsService } from '../src/jobs/jobs.service';
 import { JobsStore } from '../src/jobs/jobs.store';
@@ -92,7 +90,6 @@ describe('JobsProcessor', () => {
       const first = processor.tickOnce();
       await waitFor(() => task.started.length === 1);
 
-      // 진행 중인데 다시 호출 — 즉시 반환하고 아무것도 선점하지 않는다.
       await processor.tickOnce();
       expect(task.started).toHaveLength(1);
 
@@ -236,9 +233,9 @@ describe('JobsProcessor', () => {
 
   describe('[SCH-005] 선점 단계 실패도 오류 경계 안에 있다', () => {
     /**
-     * 자동 호출부는 `void this.tickOnce()`이므로 catch handler가 없다.
-     * tick이 reject하면 처리되지 않은 rejection이 되어 Node 기본 동작에서
-     * 프로세스가 죽는다 — 일시적 저장 실패 하나가 스케줄러 전체를 멈춘다.
+     * 자동 호출부는 fire-and-forget이라 catch handler가 없다. tick이 reject하면
+     * 처리되지 않은 rejection이 되어 프로세스가 죽는다 — 일시적 저장 실패 하나가
+     * 스케줄러 전체를 멈춘다.
      */
     it('claimNext가 실패해도 tickOnce는 reject하지 않고 로깅한다', async () => {
       await seedJobs(dir, [makeJob({ status: 'create' })]);
@@ -277,7 +274,7 @@ describe('JobsProcessor', () => {
     });
 
     /**
-     * F1의 실제 증상은 "tick이 reject한다"가 아니라 "처리되지 않은 rejection이 되어
+     * 실제 증상은 "tick이 reject한다"가 아니라 "처리되지 않은 rejection이 되어
      * 프로세스가 죽는다"이므로, 그 신호를 직접 관측한다.
      */
     it('기동 즉시 tick의 저장 실패가 처리되지 않은 rejection을 만들지 않는다', async () => {
@@ -290,7 +287,7 @@ describe('JobsProcessor', () => {
       process.on('unhandledRejection', onUnhandled);
 
       try {
-        // 즉시 tick([SCH-001])이 도는 구성에서 선점 커밋이 실패하도록 저장을 막는다.
+        // 기동 즉시 tick이 도는 구성에서 선점 커밋이 실패하도록 저장을 막는다.
         const renameSpy = jest
           .spyOn(fsPromises, 'rename')
           .mockRejectedValue(new Error('디스크 오류'));
@@ -307,8 +304,7 @@ describe('JobsProcessor', () => {
 
         renameSpy.mockRestore();
 
-        // 프로세스가 살아 있고 다음 tick도 정상 동작한다.
-        await expect(processor.tickOnce()).resolves.toBeUndefined();
+          await expect(processor.tickOnce()).resolves.toBeUndefined();
       } finally {
         process.off('unhandledRejection', onUnhandled);
       }
@@ -332,7 +328,6 @@ describe('JobsProcessor', () => {
       await stopping;
       await tick;
 
-      // drain이 완료되면 이 프로세스가 남긴 pending은 없다.
       expect(statusOf(job.id)).toBe('done');
       await logger.flush();
       const lines = await readLogLines(config.logFilePath);
@@ -353,7 +348,7 @@ describe('JobsProcessor', () => {
       await logger.flush();
       const lines = await readLogLines(config.logFilePath);
       expect(lines.some((l) => l.includes('종료 drain 시간 초과'))).toBe(true);
-      // 남은 pending은 다음 기동의 [CON-006]이 복구한다.
+      // 남은 pending은 다음 기동의 기동 복구가 처리한다.
       expect(statusOf(job.id)).toBe('pending');
 
       task.unblock();
@@ -371,9 +366,9 @@ describe('JobsProcessor', () => {
     });
 
     /**
-     * FileLogger.log()는 append를 비동기로 예약하고 즉시 반환한다.
-     * Nest의 signal handler는 shutdown hook 직후 프로세스를 재종료하므로,
-     * flush하지 않으면 종료 로그와 직전에 대기 중이던 로그가 함께 유실된다.
+     * log()는 append를 예약만 하고 반환한다. Nest는 shutdown hook 직후
+     * 프로세스를 재종료하므로, flush하지 않으면 종료 로그와 직전에 대기 중이던
+     * 로그가 함께 유실된다.
      */
     it('종료 시 대기 중인 로그를 flush한다 (테스트가 flush를 호출하지 않아도 기록된다)', async () => {
       await seedJobs(dir, [makeJob({ status: 'create' })]);
@@ -413,7 +408,6 @@ describe('JobsProcessor', () => {
       await closing;
       await tick;
 
-      // drain이 끝났으므로 pending이 남지 않는다.
       expect((await readJobsFile(dir)).jobs[0].status).toBe('done');
     });
   });

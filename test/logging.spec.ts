@@ -1,11 +1,7 @@
-/**
- * 로거 테스트. SPEC §6 [LOG-001], [LOG-002], [LOG-005]
- * ([LOG-003]은 api.e2e-spec, [LOG-004]는 scheduler.spec에서 검증)
- */
+/** 요청 로깅은 api.e2e-spec, 스케줄러 로깅은 scheduler.spec에서 검증한다. */
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
-import { formatLogLine } from '../src/common/logging/app-logger';
-import { FileLogger } from '../src/common/logging/file-logger';
+import { FileLogger, formatLogLine } from '../src/common/logger';
 import {
   LOG_LINE_RE,
   ManualClock,
@@ -73,7 +69,6 @@ describe('FileLogger', () => {
     for (const line of lines) {
       expect(line).toMatch(LOG_LINE_RE);
     }
-    // 호출 순서가 파일 순서와 일치한다
     expect(lines[0]).toContain('message 0');
     expect(lines[99]).toContain('message 99');
   });

@@ -1,6 +1,3 @@
-/**
- * 설정 로드 테스트. SPEC §7 [CFG-001], [RUN-003]
- */
 import { configWarnings, DEFAULT_CONFIG, loadConfig } from '../src/common/config';
 
 const ENV_KEYS = [

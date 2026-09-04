@@ -1,10 +1,7 @@
-/**
- * 저장소 테스트. SPEC §3 [CON-002] ~ [CON-004], [CON-006], [RUN-004]
- */
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { AppConfig } from '../src/common/config';
-import { FileLogger } from '../src/common/logging/file-logger';
+import { FileLogger } from '../src/common/logger';
 import { JobsFileLoadError, JobsStore } from '../src/jobs/jobs.store';
 import {
   fileExists,
@@ -70,7 +67,6 @@ describe('JobsStore', () => {
 
       await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
 
-      // 데이터 보호: 원본을 덮어쓰지 않았다
       const raw = await fs.readFile(jobsJsonPath(dir), 'utf8');
       expect(raw).toContain('this is not json');
     });
@@ -78,6 +74,151 @@ describe('JobsStore', () => {
     it('[DATA-001] 최상위 jobs 배열이 없으면 오류를 던진다', async () => {
       await writeRawJobsFile(dir, JSON.stringify({ items: [] }));
       await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+    });
+
+    /**
+     * 인메모리 상태는 { jobs }만 담으므로, 최상위에 다른 키가 있는 파일을 받아들이면
+     * 다음 쓰기에서 그 키가 조용히 사라진다. 손상 파일을 자동 초기화하지 않는
+     * 방침과 정반대되는 데이터 손실이라, 로드 시점에 거부해야 한다.
+     */
+    describe('[RUN-005][DATA-001] 최상위 키 검증', () => {
+      it.each([
+        ['정의되지 않은 키가 섞임', { jobs: [], sentinel: { must: 'remain' } }],
+        ['jobs 외 다른 키만', { items: [] }],
+        ['jobs가 배열이 아님', { jobs: {} }],
+        ['최상위가 배열', []],
+        ['최상위가 배열 안 객체', [{ jobs: [] }]],
+      ])('%s이면 기동을 중단시킨다', async (_name, content) => {
+        await writeRawJobsFile(dir, JSON.stringify(content));
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      it('거부 시 원본 파일이 그대로 보존된다', async () => {
+        const raw = JSON.stringify({ jobs: [], sentinel: { must: 'remain' } });
+        await writeRawJobsFile(dir, raw);
+
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+
+        expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(raw);
+      });
+
+      it('오류 메시지가 어느 키가 문제인지 알려준다', async () => {
+        await writeRawJobsFile(dir, JSON.stringify({ jobs: [], sentinel: 1 }));
+        await expect(newStore().init()).rejects.toThrow(/sentinel/);
+      });
+    });
+
+    /**
+     * parse는 되지만 스키마가 어긋난 레코드가 통과하면, 원인에서 멀리 떨어진
+     * 런타임에서 TypeError로 터진다. 손상 JSON과 같은 취급으로 기동을 멈춘다.
+     */
+    describe('[RUN-005][DATA-002] 레코드 단위 스키마 검증', () => {
+      const valid = {
+        id: '3f1c9a6e-5b47-4d2a-9c8e-1a2b3c4d5e6f',
+        title: 't',
+        description: 'd',
+        status: 'create',
+        createdAt: '2026-09-01T00:00:00.000Z',
+        updatedAt: '2026-09-01T00:00:00.000Z',
+      };
+
+      const seedRaw = async (jobs: unknown[]): Promise<void> => {
+        await writeRawJobsFile(dir, JSON.stringify({ jobs }));
+      };
+
+      it('빈 객체 레코드는 기동을 중단시킨다', async () => {
+        await seedRaw([{}]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      it.each([
+        ['id 누락', { ...valid, id: undefined }],
+        ['id가 UUID v4가 아님', { ...valid, id: '550e8400-e29b-11d4-0716-446655440000' }],
+        ['title 누락', { ...valid, title: undefined }],
+        ['title이 문자열 아님', { ...valid, title: 123 }],
+        ['title 공백만', { ...valid, title: '   ' }],
+        ['title 길이 초과', { ...valid, title: 'a'.repeat(1001) }],
+        ['description 누락', { ...valid, description: undefined }],
+        ['description 길이 초과', { ...valid, description: 'a'.repeat(2001) }],
+        ['status가 enum 아님', { ...valid, status: 'unknown' }],
+        ['createdAt이 ISO UTC 아님', { ...valid, createdAt: '2026-09-01' }],
+        ['updatedAt 누락', { ...valid, updatedAt: undefined }],
+        ['정의되지 않은 키 포함', { ...valid, extra: 1 }],
+        ['레코드가 객체 아님', 'not-an-object'],
+      ])('%s이면 기동을 중단시킨다', async (_name, record) => {
+        await seedRaw([record]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      /**
+       * [DATA-002]는 trim된 값을 저장한다고 규정한다. 로더가 공백을 허용하면
+       * API가 만든 데이터와 손으로 고친 데이터의 규칙이 갈린다.
+       */
+      it.each(['  padded  ', 'trailing ', ' leading'])(
+        'title에 앞뒤 공백이 있으면(%j) 기동을 중단시킨다',
+        async (title) => {
+          await seedRaw([{ ...valid, title }]);
+          await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+        },
+      );
+
+      /**
+       * 형식만 보는 정규식은 존재하지 않는 시각을 통과시킨다. `2026-02-30`은
+       * JS Date가 `2026-03-02`로 넘겨버려 조용히 다른 값이 된다.
+       */
+      it.each([
+        '2026-99-99T99:99:99.999Z',
+        '2026-13-01T00:00:00.000Z',
+        '2026-02-30T00:00:00.000Z',
+        '2026-09-01T25:00:00.000Z',
+      ])('실제로 존재하지 않는 시각(%s)이면 기동을 중단시킨다', async (createdAt) => {
+        await seedRaw([{ ...valid, createdAt }]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      /**
+       * 길이는 코드포인트로 센다 — DTO(class-validator)와 같은 정의여야
+       * 성공한 POST가 재시작 불능 파일을 만들지 않는다.
+       */
+      it('이모지로 최대 길이를 채운 레코드는 정상 로드된다', async () => {
+        await seedRaw([{ ...valid, title: '😀'.repeat(1000), description: '🎉'.repeat(2000) }]);
+
+        const store = newStore();
+        await store.init();
+
+        expect([...store.snapshot().jobs[0].title]).toHaveLength(1000);
+      });
+
+      it('코드포인트가 한 자 초과하면 기동을 중단시킨다', async () => {
+        await seedRaw([{ ...valid, title: '😀'.repeat(1001) }]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      it('id가 중복되면 기동을 중단시킨다', async () => {
+        await seedRaw([valid, { ...valid, title: 'other' }]);
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+      });
+
+      it('오류 메시지가 몇 번째 레코드의 무엇이 문제인지 알려준다', async () => {
+        await seedRaw([valid, { ...valid, id: 'nope' }]);
+        await expect(newStore().init()).rejects.toThrow(/jobs\[1\].*id/);
+      });
+
+      it('규칙을 만족하는 레코드는 정상 로드된다', async () => {
+        await seedRaw([valid]);
+        const store = newStore();
+        await store.init();
+        expect(store.snapshot().jobs).toEqual([valid]);
+      });
+
+      it('검증 실패 시 원본 파일을 덮어쓰지 않는다', async () => {
+        await seedRaw([{}]);
+        const before = await fs.readFile(jobsJsonPath(dir), 'utf8');
+
+        await expect(newStore().init()).rejects.toThrow(JobsFileLoadError);
+
+        expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(before);
+      });
     });
 
     it('init을 두 번 호출해도 데이터를 다시 덮어쓰지 않는다', async () => {
@@ -107,7 +248,6 @@ describe('JobsStore', () => {
       expect(byId.get(pendingA.id)?.status).toBe('create');
       expect(byId.get(pendingB.id)?.status).toBe('create');
       expect(byId.get(pendingA.id)?.updatedAt).toBe(clock.iso());
-      // 다른 상태는 건드리지 않는다
       expect(byId.get(done.id)?.status).toBe('done');
       expect(byId.get(create.id)?.updatedAt).toBe(create.updatedAt);
     });
@@ -207,10 +347,9 @@ describe('JobsStore', () => {
         }),
       ).rejects.toThrow('디스크 오류');
 
-      // 인메모리: 교체는 저장 성공 후에만 일어난다([CON-002] 4단계)
+      // 교체는 저장 성공 후에만 일어난다
       expect(store.snapshot().jobs).toHaveLength(1);
       expect(store.snapshot().jobs[0].title).toBe('first');
-      // 디스크: 그대로
       expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(diskBefore);
     });
   });
@@ -248,7 +387,7 @@ describe('JobsStore', () => {
 
     /**
      * rename만이 실패 지점이 아니다. write/fsync/close 실패도 임시 파일을 남기면
-     * 반복되는 디스크 오류가 숨겨진 .tmp를 계속 누적시켜 [CON-003]을 깬다.
+     * 반복되는 디스크 오류가 숨겨진 .tmp를 계속 누적시킨다.
      */
     it.each(['writeFile', 'sync'] as const)(
       'FileHandle.%s가 실패해도 임시 파일을 남기지 않는다',
@@ -275,7 +414,6 @@ describe('JobsStore', () => {
 
         const files = await listDir(dir);
         expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
-        // canonical 파일은 손상되지 않는다
         expect(await fs.readFile(jobsJsonPath(dir), 'utf8')).toBe(diskBefore);
         expect(store.snapshot().jobs).toHaveLength(0);
       },
