@@ -7,11 +7,9 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../src/app.module';
-import { CLOCK, Clock } from '../../src/common/clock';
-import { APP_CONFIG, AppConfig } from '../../src/common/config';
-import { APP_LOGGER, AppLogger } from '../../src/common/logging/app-logger';
-import { JOB_TASK, JobTask } from '../../src/jobs/job-task';
-import { JobsProcessor } from '../../src/jobs/jobs.processor';
+import { APP_CONFIG, AppConfig, CLOCK, Clock } from '../../src/common/config';
+import { APP_LOGGER, AppLogger } from '../../src/common/logger';
+import { JOB_TASK, JobsProcessor, JobTask } from '../../src/jobs/jobs.processor';
 import { JobsService } from '../../src/jobs/jobs.service';
 import { JobsStore } from '../../src/jobs/jobs.store';
 import { Job } from '../../src/jobs/jobs.types';

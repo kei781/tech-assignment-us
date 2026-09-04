@@ -4,10 +4,15 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import { SystemClock } from './common/clock';
-import { APP_CONFIG, AppConfig, configWarnings, DEFAULT_CONFIG, loadConfig } from './common/config';
-import { APP_LOGGER, AppLogger } from './common/logging/app-logger';
-import { FileLogger } from './common/logging/file-logger';
+import {
+  APP_CONFIG,
+  AppConfig,
+  configWarnings,
+  DEFAULT_CONFIG,
+  loadConfig,
+  SystemClock,
+} from './common/config';
+import { APP_LOGGER, AppLogger, FileLogger } from './common/logger';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });

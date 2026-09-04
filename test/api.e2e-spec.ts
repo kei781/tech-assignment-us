@@ -4,7 +4,7 @@
 import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { AppConfig } from '../src/common/config';
-import { AppLogger } from '../src/common/logging/app-logger';
+import { AppLogger } from '../src/common/logger';
 import { JobsService } from '../src/jobs/jobs.service';
 import { JobsFileLoadError } from '../src/jobs/jobs.store';
 import { createTestApp } from './helpers/app-factory';

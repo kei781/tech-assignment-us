@@ -7,13 +7,10 @@
  */
 import { ConflictException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { CLOCK, Clock, isoNow } from '../common/clock';
-import { CreateJobDto } from './dto/create-job.dto';
-import { SearchJobsDto } from './dto/search-jobs.dto';
-import { UpdateJobDto } from './dto/update-job.dto';
-import { MESSAGES } from './jobs.messages';
+import { CLOCK, Clock, isoNow } from '../common/config';
+import { CreateJobDto, SearchJobsDto, UpdateJobDto } from './jobs.dto';
 import { JobsStore } from './jobs.store';
-import { compareJobs, Job } from './jobs.types';
+import { compareJobs, Job, MESSAGES } from './jobs.types';
 
 @Injectable()
 export class JobsService {

@@ -8,7 +8,7 @@ import { INestApplication } from '@nestjs/common';
 import { promises as fs } from 'node:fs';
 import request from 'supertest';
 import { AppConfig } from '../src/common/config';
-import { AppLogger } from '../src/common/logging/app-logger';
+import { AppLogger } from '../src/common/logger';
 import { JobsProcessor } from '../src/jobs/jobs.processor';
 import { JobsService } from '../src/jobs/jobs.service';
 import { JobsStore } from '../src/jobs/jobs.store';

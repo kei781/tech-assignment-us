@@ -4,8 +4,7 @@
  */
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
-import { formatLogLine } from '../src/common/logging/app-logger';
-import { FileLogger } from '../src/common/logging/file-logger';
+import { FileLogger, formatLogLine } from '../src/common/logger';
 import {
   LOG_LINE_RE,
   ManualClock,

@@ -361,20 +361,22 @@ create ── 스케줄러 선점 ──▶ pending ── 처리 완료 ──�
 
 ```text
 src/
-├─ main.ts              # NestFactory.create(AppModule)
-├─ app.module.ts        # ScheduleModule.forRoot() 포함
-├─ jobs/
-│  ├─ jobs.controller.ts
-│  ├─ jobs.service.ts
-│  ├─ jobs.processor.ts # @Interval 스케줄러
-│  ├─ jobs.store.ts     # mutex + 원자적 저장 + 기동 복구
-│  └─ dto/
-└─ common/
-   ├─ logging/          # logs.txt 로거 + 요청 로깅 미들웨어 (부록 A #13)
-   ├─ filters/          # 공통 에러 응답 형식
-   └─ config.ts
+├─ main.ts                 # 부트스트랩, 기동 실패 시 비-0 종료
+├─ app.module.ts           # 전역 provider(설정·시계·로거·filter·pipe) + 미들웨어 + 스케줄러
+├─ common/
+│  ├─ config.ts            # 환경 변수 로드·범위 검증 + 주입 가능한 Clock
+│  ├─ logger.ts            # 로거 계약 + logs.txt FileLogger + 요청 로깅 미들웨어
+│  └─ exception.filter.ts  # 공통 에러 응답 형식
+└─ jobs/
+   ├─ jobs.module.ts
+   ├─ jobs.controller.ts   # REST 엔드포인트
+   ├─ jobs.service.ts      # 도메인 로직 + 상태 전이
+   ├─ jobs.store.ts        # ★ mutex + 원자적 저장 + 기동 복구
+   ├─ jobs.processor.ts    # 스케줄러 tick + 주입 가능한 JobTask
+   ├─ jobs.types.ts        # Job·상태·정렬·응답 메시지
+   └─ jobs.dto.ts          # 요청 DTO 3개 + 변환기·검증기
 data/
-└─ jobs.json            # 샘플 데이터 포함, 커밋 대상
+└─ jobs.json               # 샘플 데이터 포함, 커밋 대상
 ```
 
 > **[RUN-002]** 실행 명령: `npm run start`(개발), `npm run build && npm run start:prod`. HTTP 서버와 스케줄러가 함께 뜬다.

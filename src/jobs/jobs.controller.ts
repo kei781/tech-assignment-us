@@ -17,12 +17,9 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { CreateJobDto } from './dto/create-job.dto';
-import { SearchJobsDto } from './dto/search-jobs.dto';
-import { UpdateJobDto } from './dto/update-job.dto';
-import { MESSAGES } from './jobs.messages';
+import { CreateJobDto, SearchJobsDto, UpdateJobDto } from './jobs.dto';
 import { JobsService } from './jobs.service';
-import { Job } from './jobs.types';
+import { Job, MESSAGES } from './jobs.types';
 
 /** [API-040] :id는 UUID 형식(버전 무관)이어야 하며, 아니면 400 */
 const uuidParam = new ParseUUIDPipe({

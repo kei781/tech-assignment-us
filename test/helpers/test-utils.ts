@@ -4,8 +4,7 @@
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { Clock } from '../../src/common/clock';
-import { AppConfig, DEFAULT_CONFIG } from '../../src/common/config';
+import { AppConfig, Clock, DEFAULT_CONFIG } from '../../src/common/config';
 import { emptyJobsFile, Job, JobsFile, JobStatus } from '../../src/jobs/jobs.types';
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

@@ -1,7 +1,6 @@
 import { Module } from '@nestjs/common';
-import { DelayJobTask, JOB_TASK } from './job-task';
 import { JobsController } from './jobs.controller';
-import { JobsProcessor } from './jobs.processor';
+import { DelayJobTask, JOB_TASK, JobsProcessor } from './jobs.processor';
 import { JobsService } from './jobs.service';
 import { JobsStore } from './jobs.store';
 

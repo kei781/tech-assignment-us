@@ -4,7 +4,7 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { AppConfig } from '../src/common/config';
-import { FileLogger } from '../src/common/logging/file-logger';
+import { FileLogger } from '../src/common/logger';
 import { JobsFileLoadError, JobsStore } from '../src/jobs/jobs.store';
 import {
   fileExists,

@@ -12,7 +12,7 @@ import {
   Inject,
 } from '@nestjs/common';
 import { Response } from 'express';
-import { APP_LOGGER, AppLogger } from '../logging/app-logger';
+import { APP_LOGGER, AppLogger } from './logger';
 
 const INTERNAL_ERROR_MESSAGE = '요청 처리 중 오류가 발생했습니다.';
 

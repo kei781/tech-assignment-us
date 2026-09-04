@@ -402,27 +402,26 @@ writer가 하나이므로 **기동 시점에 진행 중인 처리는 존재할 �
 ## 6. 프로젝트 구조
 
 ```text
-src/
-├─ main.ts                          # 부트스트랩, 기동 실패 시 비-0 종료
-├─ app.module.ts                    # ScheduleModule + 요청 로깅 미들웨어
-├─ jobs/
-│  ├─ jobs.controller.ts            # REST 엔드포인트
-│  ├─ jobs.service.ts               # 도메인 로직 + 상태 전이
-│  ├─ jobs.processor.ts             # 스케줄러 tick, 재진입 guard, 종료 drain
-│  ├─ jobs.store.ts                 # ★ mutex + 원자적 저장 + 기동 복구
-│  ├─ jobs.types.ts
-│  ├─ job-task.ts                   # 주입 가능한 처리 로직
-│  └─ dto/
-└─ common/
-   ├─ config.ts                     # 환경 변수 로드
-   ├─ clock.ts                      # 주입 가능한 시계
-   ├─ logging/                      # logs.txt 로거 + 요청 로깅 미들웨어
-   └─ filters/                      # 공통 에러 응답 형식
+src/                          12개 파일, 2개 디렉터리
+├─ main.ts                    부트스트랩, 기동 실패 시 비-0 종료
+├─ app.module.ts              전역 provider(설정·시계·로거·filter·pipe) + 미들웨어 + 스케줄러
+├─ common/
+│  ├─ config.ts               환경 변수 로드·범위 검증 + 주입 가능한 Clock
+│  ├─ logger.ts               로거 계약 + logs.txt FileLogger + 요청 로깅 미들웨어
+│  └─ exception.filter.ts     공통 에러 응답 형식
+└─ jobs/
+   ├─ jobs.module.ts
+   ├─ jobs.controller.ts      REST 엔드포인트
+   ├─ jobs.service.ts         도메인 로직 + 상태 전이
+   ├─ jobs.store.ts           ★ mutex + 원자적 저장 + 기동 복구
+   ├─ jobs.processor.ts       스케줄러 tick + 주입 가능한 JobTask
+   ├─ jobs.types.ts           Job·상태·정렬·응답 메시지
+   └─ jobs.dto.ts             요청 DTO 3개 + 변환기·검증기
 data/
-└─ jobs.json                        # 샘플 데이터 (커밋 대상)
+└─ jobs.json                  샘플 데이터 (커밋 대상)
 docs/
-├─ SPEC.md                          # 요구사항 명세 (테스트가 ID를 참조)
-└─ nestjs-jobs-backend-design.md    # 초기 다중 프로세스 설계 (철회)
+├─ SPEC.md                    요구사항 명세 (테스트가 ID를 참조)
+└─ nestjs-jobs-backend-design.md   초기 다중 프로세스 설계 (철회)
 ```
 
 동시성 설계는 전부 `src/jobs/jobs.store.ts` 한 파일에 있습니다. 이 파일만 읽으면 데이터 무결성 보장의 전부를 확인할 수 있습니다.

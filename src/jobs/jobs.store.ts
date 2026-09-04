@@ -12,9 +12,8 @@ import { randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { Config, JsonDB } from 'node-json-db';
-import { CLOCK, Clock, isoNow } from '../common/clock';
-import { APP_CONFIG, AppConfig } from '../common/config';
-import { APP_LOGGER, AppLogger } from '../common/logging/app-logger';
+import { APP_CONFIG, AppConfig, CLOCK, Clock, isoNow } from '../common/config';
+import { APP_LOGGER, AppLogger } from '../common/logger';
 import { emptyJobsFile, JobsFile } from './jobs.types';
 
 /** [RUN-004] jobs.json을 신뢰할 수 없어 기동을 중단해야 하는 상황 */
