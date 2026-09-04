@@ -140,6 +140,8 @@ create ── 스케줄러 선점 ──▶ pending ── 처리 완료 ──�
 > **[CON-003]** (원자적 저장) 저장은 임시 파일에 전체 내용을 기록하고 `fsync`한 뒤 `fs.rename`으로 `jobs.json`을 교체한다. `rename`은 원자적이므로 저장 도중 프로세스가 죽어도 `jobs.json`은 항상 이전 또는 이후의 완전한 상태이며, 절단된 파일이 남지 않는다.
 >
 > 임시 파일명은 `jobs.json.<random>.tmp` 형식으로 만들고 저장 후 남기지 않는다. `node-json-db`는 데이터 파싱·조작에 사용하되 디스크 게시는 이 절차로 수행한다(자체 save 경로는 원자성을 보장하지 않는다 — README에 사유 기재).
+>
+> **임시 파일 정리는 `open` 이후의 모든 실패 지점에 적용한다** — write·fsync·close·rename 어디서 실패해도 임시 파일을 지운 뒤 오류를 전파한다. `rename` 실패만 정리하면 반복되는 디스크 오류가 숨겨진 `.tmp`를 계속 누적시켜 "임시 파일 잔존 없음"이 깨진다.
 
 > **[CON-004]** (읽기) 읽기는 인메모리 상태에서 동기적으로 수행하며, 반환 전에 복사(스냅샷)한다. [CON-002]의 변경이 동기 구간에서 적용되므로 읽기가 부분 적용 상태를 관측할 수 없고, 따라서 읽기는 mutex를 필요로 하지 않는다.
 >
@@ -158,6 +160,8 @@ create ── 스케줄러 선점 ──▶ pending ── 처리 완료 ──�
 > **[CON-007]** (정상 종료) `SIGINT`/`SIGTERM` 또는 Nest shutdown hook에서: ① 새 스케줄러 tick을 차단하고 ② 진행 중인 tick이 끝날 때까지 `SHUTDOWN_DRAIN_MS`(기본 10,000ms)까지 대기한다.
 >
 > tick은 항상 `done` 커밋 또는 `create` 롤백으로 끝나므로([SCH-004], [SCH-005]) drain이 완료되면 이 프로세스가 남긴 `pending`은 없다. drain이 시간 내 끝나지 않거나 프로세스가 강제 종료되면 [CON-006]이 다음 기동에서 복구한다.
+>
+> ③ 마지막으로 **대기 중인 로그 append를 flush한다**([LOG-001]). Nest의 signal handler는 shutdown hook 직후 프로세스를 재종료하므로, flush하지 않으면 종료 로그뿐 아니라 직전에 예약된 요청·처리 로그까지 유실된다.
 
 ### 동시성 규칙 요약
 
@@ -299,6 +303,8 @@ create ── 스케줄러 선점 ──▶ pending ── 처리 완료 ──�
 > 실제 비즈니스 작업은 이 과제에서 정의하지 않는다. 처리 로직은 주입 가능한 형태로 두어 테스트가 실제 대기 없이 검증할 수 있게 한다([TST-002]).
 
 > **[SCH-005]** 처리 중 예외가 발생하면 [CON-002] mutex 구간에서 해당 Job이 `pending`인지 확인하고 `create`로 롤백한다(`updatedAt = now`). 예외는 로깅하되 프로세스를 중단시키지 않으며, `isProcessing` guard는 성공·실패·예외 어느 경로에서도 반드시 해제한다.
+>
+> **오류 경계는 선점([SCH-003])과 완료([SCH-004])까지 포함하며, tick은 어떤 이유로도 호출자에게 reject를 전파하지 않는다.** 자동 호출부(interval callback, [SCH-001] 기동 즉시 tick)는 catch handler를 둘 수 없는 fire-and-forget 경로이므로, reject가 새어나가면 처리되지 않은 rejection이 되어 Node 기본 동작에서 프로세스가 죽는다 — 일시적 저장 실패 하나가 스케줄러 전체를 멈추고 오류 로그도 남기지 않는다. 선점 커밋도 디스크 쓰기이므로 실패할 수 있다.
 
 ---
 
@@ -307,6 +313,8 @@ create ── 스케줄러 선점 ──▶ pending ── 처리 완료 ──�
 > 과제 필수 요구사항이나 설계 문서에 누락되어 있던 항목이다.
 
 > **[LOG-001]** 프로젝트 루트의 `logs.txt`(경로는 `LOG_FILE_PATH`로 재정의 가능)에 **append 모드**로 기록한다. 한 로그 항목은 한 번의 append 호출로 기록한다.
+>
+> 기록은 비동기로 예약하고 즉시 반환한다([LOG-005] best-effort). 대신 로거는 `flush()`를 제공하고 **종료 시 flush를 보장**해야 한다([CON-007] ③) — 그러지 않으면 예약된 항목이 프로세스 종료와 함께 사라져 "모든 요청을 로깅"([LOG-003])이 정상 종료 경로에서 깨진다.
 
 > **[LOG-002]** 로그 라인 형식:
 
@@ -338,8 +346,12 @@ create ── 스케줄러 선점 ──▶ pending ── 처리 완료 ──�
 | `CONSUME_INTERVAL_MS` | 60,000 |
 | `JOB_PROCESSING_MS` | 5,000 |
 | `SHUTDOWN_DRAIN_MS` | 10,000 |
+| `SCHEDULER_ENABLED` | `true` |
 
-- 제약: `JOB_PROCESSING_MS < CONSUME_INTERVAL_MS` — 그렇지 않으면 [SCH-002] guard가 매 tick 발동해 실효 처리량이 절반 이하로 떨어진다.
+- 제약: `JOB_PROCESSING_MS < CONSUME_INTERVAL_MS` — 그렇지 않으면 [SCH-002] guard가 매 tick 발동해 실효 처리량이 절반 이하로 떨어진다. 위반 시 기동을 막지는 않고 `WARN`을 남긴다.
+- **범위 검증**: 모든 ms 설정은 정수여야 하며 `2,147,483,647`(Node timer의 32-bit signed 한계)을 넘을 수 없다. `CONSUME_INTERVAL_MS`는 **1 이상**이어야 한다 — `setInterval(fn, 0)`이나 범위를 넘는 delay는 libuv가 1ms로 보정하므로, 빈 큐에서도 매 tick 로그를 append해 오설정 하나가 CPU/I-O 폭주와 `logs.txt` 폭증으로 바뀐다. `JOB_PROCESSING_MS`·`SHUTDOWN_DRAIN_MS`는 "대기 없음"이라는 의미가 있으므로 `0`을 허용한다. 위반은 기동 시점에 오류로 거부한다.
+- `Node 20+`가 필요하다([RUN-003]) — `package.json`의 `engines`에 선언한다.
+- `SCHEDULER_ENABLED=false`면 interval 등록과 기동 즉시 tick([SCH-001])을 모두 건너뛴다. 테스트가 tick 시점을 직접 통제하기 위한 seam이며([TST-002]), API만 띄우는 운영 구성에도 쓸 수 있다.
 
 ---
 
@@ -358,7 +370,7 @@ src/
 │  ├─ jobs.store.ts     # mutex + 원자적 저장 + 기동 복구
 │  └─ dto/
 └─ common/
-   ├─ logging/          # logs.txt 로거 + 요청 로깅 인터셉터
+   ├─ logging/          # logs.txt 로거 + 요청 로깅 미들웨어 (부록 A #13)
    ├─ filters/          # 공통 에러 응답 형식
    └─ config.ts
 data/
@@ -428,6 +440,8 @@ data/
 | 10 | `jobs.json` 저장 | `node-json-db` save | 임시 파일 + `fsync` + 원자적 `rename` | 저장 중 종료로 인한 파일 손상 방지 |
 | 11 | 처리 시간 | 1분 | 5초 (`JOB_PROCESSING_MS`) | 과제가 허용한 자유 가정. `CONSUME_INTERVAL_MS`보다 작게 두어 [SCH-002] guard가 상시 발동하지 않게 한다 |
 | 12 | 기동 시 즉시 tick | 없음 | [SCH-001] | 확인을 위해 첫 주기를 기다리지 않게 한다 |
+| 13 | 요청 로깅 방식 | 인터셉터 | **미들웨어** (`res.on('finish')`) | 인터셉터는 exception filter가 상태 코드를 확정하기 전에 종료되므로 에러 응답의 실제 코드를 알 수 없다. 미들웨어는 라우트 미매칭·validation 실패·filter가 만든 응답까지 최종 코드로 기록해 [LOG-003]의 "모든 요청"을 만족한다 |
+| 14 | `SCHEDULER_ENABLED` | 없음 | §7에 추가 | tick 시점을 테스트가 통제하기 위한 seam([TST-002]). API만 띄우는 운영 구성에도 쓸 수 있다 |
 
 ## 부록 B. 초기설계 대비 확정 사항
 
