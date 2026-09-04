@@ -19,6 +19,7 @@ describe('FileLogger', () => {
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     await rmDir(dir);
   });
 
@@ -96,6 +97,36 @@ describe('FileLogger', () => {
     const logger = new FileLogger(config, clock);
     expect(() => logger.log('INFO', 'http', 'should not throw')).not.toThrow();
     await expect(logger.flush()).resolves.toBeUndefined();
+  });
+
+  /**
+   * append가 거부되면 체인이 rejected로 굳는다. `log()`의 실패 슬롯이 그것을
+   * 되살리는 유일한 수단인데(흡수 전용 단계가 없다), 슬롯을 지워도 통과하는
+   * 테스트만 있으면 다음 정리에서 도달 불가능 코드로 오인되어 삭제된다.
+   *
+   * append는 내부에서 오류를 삼켜 스스로 거부하지 않으므로, 그 보장이 깨진
+   * 상황을 만들려면 append 자체를 한 번 거부시켜야 한다.
+   */
+  it('[LOG-005] append가 한 번 거부돼도 이후 로그가 계속 기록된다', async () => {
+    const clock = new ManualClock();
+    const config = testConfig(dir);
+    const logger = new FileLogger(config, clock);
+
+    const appendSpy = jest
+      .spyOn(logger as unknown as { append: (line: string) => Promise<void> }, 'append')
+      .mockRejectedValueOnce(new Error('append 실패'));
+
+    logger.log('INFO', 'http', '첫째 — 거부된다');
+    logger.log('INFO', 'http', '둘째 — 기록되어야 한다');
+    logger.log('INFO', 'http', '셋째 — 기록되어야 한다');
+    await logger.flush();
+
+    expect(appendSpy).toHaveBeenCalledTimes(3);
+
+    const lines = await readLogLines(config.logFilePath);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('둘째');
+    expect(lines[1]).toContain('셋째');
   });
 
   it('[LOG-002] formatLogLine은 명세된 형식을 만든다', () => {

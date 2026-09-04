@@ -123,17 +123,22 @@ create ── 스케줄러 선점 ──▶ pending ── 처리 완료 ──�
 > mutex는 promise chain으로 구현한다 — 새 작업은 직전 작업의 완료(성공·실패 무관) 뒤에 실행된다. 별도 라이브러리를 쓰지 않는다.
 >
 > ```ts
-> private tail: Promise<unknown> = Promise.resolve();
+> private mutexChain: Promise<unknown> = Promise.resolve();
 >
-> runExclusive<T>(fn: () => Promise<T>): Promise<T> {
->   const result = this.tail.then(fn, fn);
->   this.tail = result.then(
+> runExclusive<T>(task: () => Promise<T>): Promise<T> {
+>   const result = this.mutexChain.then(task);
+>
+>   // 성공·실패를 모두 흡수해 체인을 항상 fulfilled로 유지한다.
+>   this.mutexChain = result.then(
 >     () => undefined,
 >     () => undefined,
 >   );
+>
 >   return result;
 > }
 > ```
+>
+> **체인을 지키는 것은 흡수 단계다.** 앞선 변경이 실패해도 체인이 rejected로 굳지 않아야 이후 변경이 계속 실행된다. 실패는 `result`를 통해 그 변경의 호출자에게만 전달된다. 흡수 단계를 한쪽만 연결하면 첫 실패 이후 모든 변경이 영구히 멈춘다.
 >
 > 4단계 순서가 중요하다: 저장이 실패하면 인메모리 상태가 변경 전으로 남아 디스크와 어긋나지 않는다.
 >
